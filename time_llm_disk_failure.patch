@@ -1,0 +1,3166 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..669fed3
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++*.pyc
++results/*
++ckpt/*
++*.log
+\ No newline at end of file
+diff --git a/Baseline-README.md b/Baseline-README.md
+new file mode 100644
+index 0000000..969cfb2
+--- /dev/null
++++ b/Baseline-README.md
+@@ -0,0 +1,7 @@
++# Time-LLM Baseline
++
++```bash
++export BACKBLAZE_MAX_WINDOWS_PER_SERIAL=0
++export BACKBLAZE_NEG_TO_POS_RATIO=5
++nohup bash scripts/backblaze_debug.sh {DISK_MODEL_0} {DISK_MODEL_1} ... --fast_train_only > train.log 2>&1 &
++```
+\ No newline at end of file
+diff --git a/check_split_ratio.py b/check_split_ratio.py
+new file mode 100644
+index 0000000..e24c4a2
+--- /dev/null
++++ b/check_split_ratio.py
+@@ -0,0 +1,11 @@
++import pandas as pd
++
++root = "" # TODO: path to the directory of train/val/test.csv
++
++for split in ["train", "val", "test"]:
++    path = f"{root}/{split}.csv"
++    df = pd.read_csv(path)
++    ratio = df["failure_7d"].mean()
++    print(f"{split}: rows={len(df)}, positive_ratio={ratio:.6f}")
++    print(df["failure_7d"].value_counts(dropna=False))
++    print("-" * 40)
+\ No newline at end of file
+diff --git a/cross_evaluate_results.py b/cross_evaluate_results.py
+new file mode 100644
+index 0000000..bd16b45
+--- /dev/null
++++ b/cross_evaluate_results.py
+@@ -0,0 +1,67 @@
++import pandas as pd
++import numpy as np
++
++# DISK_MODEL = "TOSHIBA MG08ACA16TEY"
++MODEL_DISK_MODEL = "HGST HUH721212ALN604"
++DATA_DISK_MODEL = "HGST HUH721212ALE604"
++CSV_PATH = f"./results/{MODEL_DISK_MODEL}__to__{DATA_DISK_MODEL}_inference.csv"
++
++df = pd.read_csv(CSV_PATH)
++
++# =========================
++# Basic counts
++# =========================
++y_true = df["y_true"].values
++y_pred = df["y_pred"].values
++
++TP = np.sum((y_true == 1) & (y_pred == 1))
++FP = np.sum((y_true == 0) & (y_pred == 1))
++TN = np.sum((y_true == 0) & (y_pred == 0))
++FN = np.sum((y_true == 1) & (y_pred == 0))
++
++print("Confusion Matrix:")
++print(f"TP={TP}, FP={FP}, TN={TN}, FN={FN}")
++
++# =========================
++# Metrics
++# =========================
++precision = TP / (TP + FP + 1e-12)
++recall = TP / (TP + FN + 1e-12)
++accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-12)
++f1 = 2 * precision * recall / (precision + recall + 1e-12)
++
++print("\nPoint-wise Metrics:")
++print(f"Precision: {precision:.4f}")
++print(f"Recall:    {recall:.4f}")
++print(f"Accuracy:  {accuracy:.4f}")
++print(f"F1:        {f1:.4f}")
++
++# =========================
++# Event-level Recall
++# =========================
++# 定义：
++# 对每个 serial，如果：
++#   存在 y_true == 1
++# 且 存在至少一个 (y_true == 1 且 y_pred == 1)
++# → 记为一个 TP event
++
++event_tp = 0
++event_total = 0
++
++for serial, g in df.groupby("serial_number"):
++    has_failure = (g["y_true"] == 1).any()
++    
++    if has_failure:
++        event_total += 1
++        
++        detected = ((g["y_true"] == 1) & (g["y_pred"] == 1)).any()
++        
++        if detected:
++            event_tp += 1
++
++event_recall = event_tp / (event_total + 1e-12)
++
++print("\nEvent-level Metrics:")
++print(f"Event-level TP: {event_tp}")
++print(f"Total failure serials: {event_total}")
++print(f"Event-level Recall: {event_recall:.4f}")
+\ No newline at end of file
+diff --git a/cross_inference.py b/cross_inference.py
+new file mode 100644
+index 0000000..29472a1
+--- /dev/null
++++ b/cross_inference.py
+@@ -0,0 +1,431 @@
++import os
++import random
++import numpy as np
++import pandas as pd
++import torch
++import json
++
++from models import TimeLLM
++
++
++FEATURE_JSON_PATH = "" # TODO: path to the feature json file
++
++# =========================================================
++# Source model vs target data
++# =========================================================
++MODEL_DISK_MODEL = "HGST HUH721212ALN604"   # checkpoint / feature schema comes from this model
++DATA_DISK_MODEL  = "HGST HUH721212ALE604"   # inference data comes from this model
++
++# =========================================================
++# Config
++# =========================================================
++CKPT_PATH = f"./ckpt/time_llm_{MODEL_DISK_MODEL}.pth"
++
++TEST_CSV = "" # TODO: path to the csv of the DATA_DISK_MODEL
++
++LOCAL_INFERENCE_CSV = (
++    "" # TODO: path to the csv file of the DATA_DISK_MODEL test dataset
++)
++USE_LOCAL_INFERENCE_CSV = LOCAL_INFERENCE_CSV is not None
++
++OUTPUT_CSV = f"./results/{MODEL_DISK_MODEL}__to__{DATA_DISK_MODEL}_inference.csv"
++
++RANDOM_SEED = 42
++NUM_SERIALS = 10
++SEQ_LEN = 14
++ALLOW_SHORT_HISTORY = True
++PRED_LEN = 1
++LABEL_LEN = 0
++BATCH_SIZE = 64
++
++TARGET_COL = "failure_7d"
++
++
++# =========================================================
++# Args for TimeLLM
++# =========================================================
++class Args:
++    def __init__(self):
++        self.task_name = "classification"
++
++        self.seq_len = SEQ_LEN
++        self.label_len = LABEL_LEN
++        self.pred_len = PRED_LEN
++
++        self.enc_in = None
++        self.dec_in = None
++        self.c_out = 1
++
++        self.d_model = 16
++        self.n_heads = 8
++        self.e_layers = 2
++        self.d_layers = 1
++        self.d_ff = 32
++        self.factor = 1
++        self.dropout = 0.1
++        self.embed = "timeF"
++        self.activation = "gelu"
++        self.output_attention = False
++
++        self.patch_len = 16
++        self.stride = 8
++        self.prompt_domain = 0
++
++        self.llm_model = "GPT2"
++        self.llm_dim = 768
++        self.llm_layers = 6
++
++        self.model = "TimeLLM"
++        self.model_id = "cross_model_inference"
++        self.model_comment = f"{MODEL_DISK_MODEL}_to_{DATA_DISK_MODEL}"
++        self.des = "cross_model_inference"
++
++        self.use_amp = False
++        self.content = "Backblaze disk failure prediction"
++
++
++# =========================================================
++# Helpers
++# =========================================================
++def build_time_features(dt_index: pd.DatetimeIndex) -> np.ndarray:
++    """
++    Build simple time marks:
++    month / day / weekday
++    shape: [seq_len, 3]
++    """
++    return np.stack(
++        [
++            dt_index.month.values,
++            dt_index.day.values,
++            dt_index.weekday.values,
++        ],
++        axis=1,
++    ).astype(np.float32)
++
++
++def build_samples_from_subset(df: pd.DataFrame):
++    """
++    Build sliding-window samples from selected serials.
++
++    One inference sample per row.
++    If there are fewer than SEQ_LEN historical rows available,
++    left-pad by repeating the earliest row.
++    """
++    samples = []
++
++    df = df.copy()
++    df["date"] = pd.to_datetime(df["date"])
++    df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
++
++    skipped_short_serials = 0
++
++    for serial, g in df.groupby("serial_number"):
++        g = g.sort_values("date").reset_index(drop=True)
++
++        if len(g) < SEQ_LEN and not ALLOW_SHORT_HISTORY:
++            skipped_short_serials += 1
++            continue
++
++        feat_arr = g[FEATURE_COLS].astype(np.float32).fillna(0.0).values
++        label_arr = g[TARGET_COL].fillna(0).astype(np.float32).values
++        date_arr = pd.to_datetime(g["date"])
++
++        if ALLOW_SHORT_HISTORY:
++            end_indices = range(len(g))
++        else:
++            end_indices = range(SEQ_LEN - 1, len(g))
++
++        for end_idx in end_indices:
++            start_idx = max(0, end_idx - SEQ_LEN + 1)
++
++            seq_x = feat_arr[start_idx:end_idx + 1]
++            x_dates = date_arr.iloc[start_idx:end_idx + 1]
++            y_true = float(label_arr[end_idx])
++            end_date = x_dates.iloc[-1]
++
++            current_len = seq_x.shape[0]
++            if current_len < SEQ_LEN:
++                pad_len = SEQ_LEN - current_len
++                pad_feat = np.repeat(seq_x[:1], pad_len, axis=0)
++                seq_x = np.concatenate([pad_feat, seq_x], axis=0)
++
++                first_date = x_dates.iloc[0]
++                pad_dates = pd.DatetimeIndex([first_date] * pad_len)
++                x_dates = pd.DatetimeIndex(pad_dates.tolist() + list(pd.DatetimeIndex(x_dates)))
++            else:
++                x_dates = pd.DatetimeIndex(x_dates)
++
++            seq_x_mark = build_time_features(x_dates)
++            seq_y_mark = build_time_features(pd.DatetimeIndex([end_date]))
++
++            samples.append(
++                {
++                    "serial_number": serial,
++                    "end_date": str(end_date.date()),
++                    "seq_x": seq_x,
++                    "seq_x_mark": seq_x_mark,
++                    "seq_y_mark": seq_y_mark,
++                    "y_true": int(y_true),
++                }
++            )
++
++    if skipped_short_serials > 0:
++        print(f"Skipped {skipped_short_serials} short serials because ALLOW_SHORT_HISTORY is False")
++
++    return samples
++
++
++def batchify_samples(samples, batch_size):
++    for start in range(0, len(samples), batch_size):
++        yield samples[start:start + batch_size]
++
++
++def collate_batch(batch):
++    seq_x = torch.tensor(np.stack([x["seq_x"] for x in batch]), dtype=torch.float32)
++    seq_x_mark = torch.tensor(np.stack([x["seq_x_mark"] for x in batch]), dtype=torch.float32)
++    seq_y_mark = torch.tensor(np.stack([x["seq_y_mark"] for x in batch]), dtype=torch.float32)
++
++    metadata = [
++        {
++            "serial_number": x["serial_number"],
++            "end_date": x["end_date"],
++            "y_true": x["y_true"],
++        }
++        for x in batch
++    ]
++
++    return seq_x, seq_x_mark, seq_y_mark, metadata
++
++
++def load_model():
++    args = Args()
++    args.enc_in = len(FEATURE_COLS)
++    args.dec_in = len(FEATURE_COLS)
++
++    model = TimeLLM.Model(args)
++
++    print(f"Loading checkpoint from: {CKPT_PATH}")
++    ckpt = torch.load(CKPT_PATH, map_location="cpu")
++
++    model_state = model.state_dict()
++    matched_state = {}
++    skipped = []
++
++    for k, v in ckpt.items():
++        if k in model_state and model_state[k].shape == v.shape:
++            matched_state[k] = v
++        else:
++            target_shape = tuple(model_state[k].shape) if k in model_state else None
++            skipped.append((k, tuple(v.shape), target_shape))
++
++    model_state.update(matched_state)
++    model.load_state_dict(model_state, strict=False)
++
++    print(f"Matched params loaded: {len(matched_state)}")
++    print(f"Skipped params: {len(skipped)}")
++    if skipped:
++        print("First skipped params:")
++        for item in skipped[:10]:
++            print(item)
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    model = model.to(device)
++
++    print(f"Model device: {next(model.parameters()).device}")
++    model.eval()
++    return model, args
++
++
++def load_inference_dataframe():
++    """
++    Load either:
++    1) a user-provided local csv for full inference, or
++    2) the default test csv for DATA_DISK_MODEL.
++    """
++    csv_path = LOCAL_INFERENCE_CSV if USE_LOCAL_INFERENCE_CSV else TEST_CSV
++    print(f"Loading inference data from: {csv_path}")
++    # df = pd.read_csv(csv_path)
++    df = pd.read_csv(
++        csv_path,
++        low_memory=False,
++        na_values=["\\N", "NULL", "null", "None", ""]
++    )
++    print(f"Loaded dataframe length: {len(df)}")
++    return df
++
++
++def align_feature_columns(df: pd.DataFrame, feature_cols):
++    """
++    Keep the MODEL_DISK_MODEL feature order, but tolerate missing features in the
++    target dataframe by creating them as all-zero columns.
++
++    This preserves the checkpoint input dimension, so cross-model inference can
++    still run even when DATA_DISK_MODEL does not contain every expected feature.
++    """
++    df = df.copy()
++
++    missing_feature_cols = [c for c in feature_cols if c not in df.columns]
++    present_feature_cols = [c for c in feature_cols if c in df.columns]
++
++    if missing_feature_cols:
++        print(f"Missing {len(missing_feature_cols)} feature columns in target data.")
++        print("They will be added as 0.0-filled columns so inference can continue.")
++        print("First missing features:", missing_feature_cols[:20])
++        for c in missing_feature_cols:
++            df[c] = 0.0
++    else:
++        print("All expected feature columns are present.")
++
++    print(f"Present feature columns: {len(present_feature_cols)} / {len(feature_cols)}")
++    return df, present_feature_cols, missing_feature_cols
++
++# =========================================================
++# Main
++# =========================================================
++def main():
++    random.seed(RANDOM_SEED)
++    np.random.seed(RANDOM_SEED)
++
++    if not os.path.exists(CKPT_PATH):
++        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
++
++    with open(FEATURE_JSON_PATH, "r") as f:
++        feature_map = json.load(f)
++
++    if MODEL_DISK_MODEL not in feature_map:
++        raise ValueError(f"{MODEL_DISK_MODEL} not found in feature json")
++
++    selected_base = feature_map[MODEL_DISK_MODEL]
++
++    global FEATURE_COLS
++    FEATURE_COLS = [f"{x}_raw" for x in selected_base]
++
++    print("=" * 80)
++    print("Cross-model / cross-dataset inference")
++    print(f"MODEL_DISK_MODEL = {MODEL_DISK_MODEL}")
++    print(f"DATA_DISK_MODEL  = {DATA_DISK_MODEL}")
++    print(f"Using feature schema from MODEL_DISK_MODEL")
++    print(f"Number of features = {len(FEATURE_COLS)}")
++    print("=" * 80)
++
++    os.makedirs("./results", exist_ok=True)
++
++    df = load_inference_dataframe()
++
++    required_non_feature_cols = ["date", "serial_number", TARGET_COL]
++    missing_non_feature = [c for c in required_non_feature_cols if c not in df.columns]
++    if missing_non_feature:
++        raise ValueError(
++            f"Missing required non-feature columns in DATA_DISK_MODEL dataframe:\n{missing_non_feature}"
++        )
++
++    df["date"] = pd.to_datetime(df["date"])
++    df, present_feature_cols, missing_feature_cols = align_feature_columns(df, FEATURE_COLS)
++
++    if USE_LOCAL_INFERENCE_CSV:
++        df_subset = df.copy()
++        print(f"Using local inference csv with {len(df_subset)} rows")
++        print(f"Distinct serials: {df_subset['serial_number'].nunique()}")
++        print(f"Date range: {df_subset['date'].min()} -> {df_subset['date'].max()}")
++        print("Running full inference on all rows in the provided csv")
++    else:
++        # Fallback sampling logic for plain test.csv mode
++        if "failure" not in df.columns:
++            raise ValueError("Column 'failure' is required for sampled test inference mode")
++
++        failure_serials = df.loc[df["failure"] == 1, "serial_number"].drop_duplicates().tolist()
++        healthy_serials = df.loc[~df["serial_number"].isin(failure_serials), "serial_number"].drop_duplicates().tolist()
++
++        num_failure = min(5, len(failure_serials))
++        num_healthy = min(5, len(healthy_serials))
++
++        chosen_failure = random.sample(failure_serials, num_failure) if num_failure > 0 else []
++        chosen_healthy = random.sample(healthy_serials, num_healthy) if num_healthy > 0 else []
++
++        chosen_serials = chosen_failure + chosen_healthy
++        random.shuffle(chosen_serials)
++
++        print(f"Chosen failure serials: {chosen_failure}")
++        print(f"Chosen healthy serials: {chosen_healthy}")
++
++        df_subset = df[df["serial_number"].isin(chosen_serials)].copy()
++
++    print("Building inference samples ...")
++    print(
++        f"Using {len(FEATURE_COLS)} total model features: "
++        f"{len(present_feature_cols)} present, {len(missing_feature_cols)} zero-filled"
++    )
++    if USE_LOCAL_INFERENCE_CSV and ALLOW_SHORT_HISTORY:
++        print("ALLOW_SHORT_HISTORY=True: building one inference sample per row with left padding for early rows")
++    else:
++        print(f"ALLOW_SHORT_HISTORY={ALLOW_SHORT_HISTORY}: using standard sliding-window behavior")
++
++    samples = build_samples_from_subset(df_subset)
++    print(f"Built {len(samples)} inference samples")
++
++    if USE_LOCAL_INFERENCE_CSV:
++        print(f"Local csv rows: {len(df_subset)}")
++        print(f"Difference (rows - samples): {len(df_subset) - len(samples)}")
++
++    if len(samples) == 0:
++        raise ValueError(
++            f"No inference samples were built. Ensure each serial has at least {SEQ_LEN} rows "
++            f"or set ALLOW_SHORT_HISTORY=True."
++        )
++
++    print("Loading model from checkpoint ...")
++    model, args = load_model()
++
++    results = []
++    model_device = next(model.parameters()).device
++    print(f"Running batched inference with batch_size={BATCH_SIZE} on {model_device}")
++
++    if args.label_len > 0:
++        raise NotImplementedError("This inference script assumes label_len == 0")
++
++    with torch.no_grad():
++        processed = 0
++        for batch in batchify_samples(samples, BATCH_SIZE):
++            seq_x, seq_x_mark, seq_y_mark, metadata = collate_batch(batch)
++
++            seq_x = seq_x.to(model_device, non_blocking=True)
++            seq_x_mark = seq_x_mark.to(model_device, non_blocking=True)
++            seq_y_mark = seq_y_mark.to(model_device, non_blocking=True)
++
++            dec_inp = torch.zeros(
++                (seq_x.size(0), args.pred_len, 1),
++                dtype=torch.float32,
++                device=model_device,
++            )
++
++            outputs = model(seq_x, seq_x_mark, dec_inp, seq_y_mark)
++            logits = outputs.detach().float().cpu().view(-1).numpy()
++            probs = torch.sigmoid(outputs).detach().float().cpu().view(-1).numpy()
++
++            for meta, logit, prob in zip(metadata, logits, probs):
++                results.append(
++                    {
++                        "model_disk_model": MODEL_DISK_MODEL,
++                        "data_disk_model": DATA_DISK_MODEL,
++                        "serial_number": meta["serial_number"],
++                        "end_date": meta["end_date"],
++                        "y_true": meta["y_true"],
++                        "logit": float(logit),
++                        "prob": float(prob),
++                        "y_pred": int(prob >= 0.5),
++                    }
++                )
++
++            processed += len(batch)
++            if processed % 512 == 0 or processed == len(samples):
++                print(f"Inferenced {processed}/{len(samples)} samples")
++
++    df_out = pd.DataFrame(results)
++    df_out.to_csv(OUTPUT_CSV, index=False)
++
++    print(f"\nSaved inference results to: {OUTPUT_CSV}")
++    print(df_out.head())
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/data_provider/data_factory.py b/data_provider/data_factory.py
+index c046f05..177e08e 100644
+--- a/data_provider/data_factory.py
++++ b/data_provider/data_factory.py
+@@ -1,6 +1,18 @@
+ from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_M4
++from data_provider.data_loader_backblaze import Dataset_Backblaze
+ from torch.utils.data import DataLoader
+ 
++# data_dict = {
++#     'ETTh1': Dataset_ETT_hour,
++#     'ETTh2': Dataset_ETT_hour,
++#     'ETTm1': Dataset_ETT_minute,
++#     'ETTm2': Dataset_ETT_minute,
++#     'ECL': Dataset_Custom,
++#     'Traffic': Dataset_Custom,
++#     'Weather': Dataset_Custom,
++#     'm4': Dataset_M4,
++# }
++
+ data_dict = {
+     'ETTh1': Dataset_ETT_hour,
+     'ETTh2': Dataset_ETT_hour,
+@@ -10,6 +22,7 @@ data_dict = {
+     'Traffic': Dataset_Custom,
+     'Weather': Dataset_Custom,
+     'm4': Dataset_M4,
++    'backblaze': Dataset_Backblaze,
+ }
+ 
+ 
+diff --git a/data_provider/data_loader_backblaze.py b/data_provider/data_loader_backblaze.py
+new file mode 100644
+index 0000000..44c6738
+--- /dev/null
++++ b/data_provider/data_loader_backblaze.py
+@@ -0,0 +1,415 @@
++import os
++import json
++import hashlib
++import pickle
++import numpy as np
++import pandas as pd
++from torch.utils.data import Dataset
++from sklearn.preprocessing import StandardScaler
++
++from utils.timefeatures import time_features
++
++import warnings
++warnings.filterwarnings('ignore')
++
++
++class Dataset_Backblaze(Dataset):
++    """
++    Backblaze dataset loader for Time-LLM-style interface.
++
++    Expected columns in input csv:
++      - date
++      - serial_number
++      - failure_7d
++      - SMART numeric columns such as smart_*_raw / smart_*_normalized
++
++    Returned items:
++      seq_x      : [seq_len, feature_dim]
++      seq_y      : [label_len + pred_len, 1]
++      seq_x_mark : [seq_len, time_feature_dim]
++      seq_y_mark : [label_len + pred_len, time_feature_dim]
++
++    Notes:
++      1. This loader is intentionally interface-compatible with the original
++         Time-LLM forecasting pipeline.
++      2. The classification label is packed into seq_y so the original
++         training loop can at least run through the data pipeline first.
++    """
++
++    def __init__(
++        self,
++        root_path,
++        flag='train',
++        size=None,
++        features='M',
++        data_path='' # TODO: path to the by month data
++        target='failure_7d',
++        scale=True,
++        timeenc=0,
++        freq='d',
++        percent=100,
++        seasonal_patterns=None
++    ):
++        if size is None:
++            self.seq_len = 30
++            self.label_len = 0
++            self.pred_len = 1
++        else:
++            self.seq_len = size[0]
++            self.label_len = size[1]
++            self.pred_len = size[2]
++
++        assert flag in ['train', 'val', 'test']
++        type_map = {'train': 0, 'val': 1, 'test': 2}
++        self.set_type = type_map[flag]
++
++        self.flag = flag
++        self.features = features
++        self.target = target
++        self.scale = scale
++        self.timeenc = timeenc
++        self.freq = freq
++        self.percent = percent
++
++        self.root_path = root_path
++        self.data_path = data_path
++
++        self.disk_model = os.path.basename(os.path.dirname(os.path.dirname(root_path.rstrip('/'))))
++        self.feature_json_path = ""  # TODO: path to the feature json file
++
++        self.scaler = StandardScaler()
++        self.samples = []
++        self.feature_cols = []
++
++        self.cache_version = 'v2'
++        self.max_windows_per_serial = 0
++        self.neg_to_pos_ratio = 2
++
++        self.max_windows_per_serial = int(os.environ.get('BACKBLAZE_MAX_WINDOWS_PER_SERIAL', '20'))
++        self.neg_to_pos_ratio = int(os.environ.get('BACKBLAZE_NEG_TO_POS_RATIO', '2'))
++        self.__read_data__()
++
++    def _build_cache_path(self, split_file):
++        cache_dir = os.path.join(self.root_path, '.cache_backblaze')
++        os.makedirs(cache_dir, exist_ok=True)
++
++        file_path = os.path.join(self.root_path, split_file)
++        file_mtime = int(os.path.getmtime(file_path))
++        train_file = os.path.join(self.root_path, 'train.csv')
++        train_mtime = int(os.path.getmtime(train_file)) if os.path.exists(train_file) else 0
++
++        feature_signature = getattr(self, 'feature_signature', 'none')
++
++        cache_key = {
++            'version': self.cache_version,
++            'flag': self.flag,
++            'seq_len': self.seq_len,
++            'label_len': self.label_len,
++            'pred_len': self.pred_len,
++            'target': self.target,
++            'percent': self.percent,
++            'scale': self.scale,
++            'timeenc': self.timeenc,
++            'freq': self.freq,
++            'split_file': split_file,
++            'split_mtime': file_mtime,
++            'train_mtime': train_mtime,
++            'max_windows_per_serial': self.max_windows_per_serial,
++            'neg_to_pos_ratio': self.neg_to_pos_ratio,
++            'feature_signature': feature_signature,
++        }
++
++        cache_name = hashlib.md5(str(cache_key).encode('utf-8')).hexdigest() + '.pkl'
++        return os.path.join(cache_dir, cache_name)
++
++    def _load_cache(self, cache_path):
++        with open(cache_path, 'rb') as f:
++            payload = pickle.load(f)
++        self.samples = payload['samples']
++        self.feature_cols = payload['feature_cols']
++        self.enc_in = payload['enc_in']
++
++    def _save_cache(self, cache_path):
++        payload = {
++            'samples': self.samples,
++            'feature_cols': self.feature_cols,
++            'enc_in': self.enc_in,
++        }
++        with open(cache_path, 'wb') as f:
++            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
++
++    def _load_selected_smart_cols(self):
++        with open(self.feature_json_path, "r") as f:
++            feature_map = json.load(f)
++
++        if self.disk_model not in feature_map:
++            raise ValueError(
++                f"Disk model {self.disk_model} not found in feature json: {self.feature_json_path}"
++            )
++
++        selected_smart_base = feature_map[self.disk_model]
++        return [f"{feat}_raw" for feat in selected_smart_base]
++
++    def _build_read_csv_kwargs(self, selected_smart_cols):
++        required_cols = ['date', 'serial_number', self.target, 'failure']
++        usecols = list(dict.fromkeys(required_cols + selected_smart_cols))
++
++        dtype_map = {
++            'serial_number': 'string',
++            self.target: np.float32,
++            'failure': np.float32,
++        }
++        for col in selected_smart_cols:
++            dtype_map[col] = np.float32
++
++        return {
++            'usecols': lambda c: c in usecols,
++            'dtype': dtype_map,
++            'low_memory': False,
++        }
++
++    def __read_data__(self):
++        if self.flag == 'train':
++            split_file = 'train.csv'
++        elif self.flag == 'val':
++            split_file = 'val.csv'
++        elif self.flag == 'test':
++            split_file = 'test.csv'
++        else:
++            raise ValueError(f"Unsupported flag: {self.flag}")
++
++        selected_smart_cols = self._load_selected_smart_cols()
++        self.feature_signature = ','.join(sorted(selected_smart_cols))
++
++        cache_path = self._build_cache_path(split_file)
++        if os.path.exists(cache_path):
++            self._load_cache(cache_path)
++            print(f"[Cache hit] Loaded cached split={self.flag} from {cache_path}")
++            return
++
++        file_path = os.path.join(self.root_path, split_file)
++        read_csv_kwargs = self._build_read_csv_kwargs(selected_smart_cols)
++        df_raw = pd.read_csv(file_path, **read_csv_kwargs)
++
++        required_cols = ['date', 'serial_number', self.target]
++        for col in required_cols:
++            if col not in df_raw.columns:
++                raise ValueError(f"Missing required column: {col}")
++
++        df_raw['date'] = pd.to_datetime(df_raw['date'])
++        df_raw = df_raw.sort_values(['serial_number', 'date']).reset_index(drop=True)
++
++        # -------- select feature columns --------
++        smart_cols = [
++            c for c in selected_smart_cols
++            if c in df_raw.columns and pd.api.types.is_numeric_dtype(df_raw[c])
++        ]
++
++        if len(smart_cols) == 0:
++            raise ValueError(
++                f"No usable feature columns found for disk model {self.disk_model}. "
++                f"Requested: {selected_smart_cols}"
++            )
++
++        feature_cols = smart_cols
++
++        # Drop target-like or non-feature columns if accidentally included
++        exclude_cols = {
++            'date', 'serial_number', 'failure', 'failure_7d',
++            'model', 'datacenter', 'cluster_id', 'vault_id',
++            'pod_id', 'pod_slot_num', 'is_legacy_format'
++        }
++        feature_cols = [c for c in feature_cols if c not in exclude_cols]
++
++        if len(feature_cols) == 0:
++            raise ValueError("No usable numeric SMART feature columns found.")
++
++        self.feature_cols = feature_cols
++        print(f"[{self.disk_model}] using {len(self.feature_cols)} features")
++
++        df_split = df_raw
++
++        # if self.set_type == 0 and self.percent < 100:
++        if self.percent < 100:
++            serials = df_split['serial_number'].drop_duplicates().tolist()
++            keep_n = max(1, int(len(serials) * self.percent / 100))
++
++            rng = np.random.default_rng(seed=42)
++            keep_serials = rng.choice(serials, size=keep_n, replace=False)
++
++            df_split = df_split[df_split['serial_number'].isin(keep_serials)].copy()
++
++        # -------- scaling --------
++        if self.scale:
++            train_file = os.path.join(self.root_path, 'train.csv')
++            train_read_csv_kwargs = self._build_read_csv_kwargs(selected_smart_cols)
++            train_df = pd.read_csv(train_file, **train_read_csv_kwargs)
++            train_values = train_df[self.feature_cols].astype(np.float32).fillna(0.0).values
++            self.scaler.fit(train_values)
++
++            split_values = df_split[self.feature_cols].astype(np.float32).fillna(0.0).values
++            df_split.loc[:, self.feature_cols] = self.scaler.transform(split_values)
++        else:
++            df_split.loc[:, self.feature_cols] = (
++                df_split[self.feature_cols].astype(np.float32).fillna(0.0)
++            )
++
++        # -------- build sliding-window samples (failure-centric sampling) --------
++        self.samples = []
++
++        for serial, g in df_split.groupby('serial_number'):
++            g = g.sort_values('date').reset_index(drop=True)
++
++            if len(g) < self.seq_len:
++                continue
++
++            feat_arr = g[self.feature_cols].values.astype(np.float32)
++            label_arr = g[self.target].fillna(0).astype(np.float32).values
++            failure_arr = g['failure'].fillna(0).astype(np.float32).values if 'failure' in g.columns else None
++            date_arr = pd.to_datetime(g['date']).values
++
++            # find true failure indices (anchor)
++            if failure_arr is not None:
++                failure_indices = np.where(failure_arr == 1)[0]
++            else:
++                failure_indices = np.array([])
++
++            window_count = 0
++
++            for s_begin in range(0, len(g) - self.seq_len + 1):
++                if self.max_windows_per_serial > 0 and window_count >= self.max_windows_per_serial:
++                    break
++
++                s_end = s_begin + self.seq_len
++                end_idx = s_end - 1
++
++                # ----------------------------
++                # failure-centric filtering
++                # ----------------------------
++                keep = False
++
++                if len(failure_indices) > 0:
++                    # distance to nearest failure
++                    dist = np.min(np.abs(failure_indices - end_idx))
++
++                    # keep near-failure windows (positive region)
++                    if dist <= 7:
++                        keep = True
++                    # keep some far-from-failure windows (negative region)
++                    elif 14 <= dist <= 30:
++                        # random downsample for negatives
++                        if np.random.rand() < 0.3:
++                            keep = True
++                else:
++                    # healthy disks → random subsample
++                    if np.random.rand() < 0.05:
++                        keep = True
++
++                if not keep:
++                    continue
++
++                seq_x = feat_arr[s_begin:s_end]
++                y = label_arr[end_idx]
++
++                x_dates = pd.to_datetime(date_arr[s_begin:s_end])
++                end_date = pd.to_datetime(x_dates[-1])
++
++                self.samples.append((seq_x, y, x_dates, serial, end_date))
++                window_count += 1
++
++        # -------- sample-level balancing for training --------
++        if self.flag == 'train':
++            pos_samples = [s for s in self.samples if s[1] == 1]
++            neg_samples = [s for s in self.samples if s[1] == 0]
++
++            print(f"[Before sampling] train positives: {len(pos_samples)}, negatives: {len(neg_samples)}")
++
++            # keep all positive samples
++            # randomly sample negatives with a controllable ratio
++            neg_to_pos_ratio = self.neg_to_pos_ratio
++
++            max_neg = min(len(neg_samples), len(pos_samples) * neg_to_pos_ratio)
++
++            rng = np.random.default_rng(seed=42)
++            if max_neg > 0:
++                chosen_neg_idx = rng.choice(len(neg_samples), size=max_neg, replace=False)
++                sampled_neg = [neg_samples[i] for i in chosen_neg_idx]
++            else:
++                sampled_neg = []
++
++            self.samples = pos_samples + sampled_neg
++            rng.shuffle(self.samples)
++
++            print(f"[After sampling] train positives: {len(pos_samples)}, sampled negatives: {len(sampled_neg)}, total: {len(self.samples)}")
++
++        if len(self.samples) == 0:
++            raise ValueError(f"No usable samples found for split={self.flag}")
++
++        self.enc_in = len(self.feature_cols)
++        self._save_cache(cache_path)
++        print(f"[Cache save] Saved cached split={self.flag} to {cache_path}")
++
++    def __getitem__(self, index):
++        # seq_x, y, x_dates = self.samples[index]
++        seq_x, y, x_dates, serial, end_date = self.samples[index]
++
++        # Keep seq_y compatible with original forecasting interface
++        seq_y_len = self.label_len + self.pred_len
++        if seq_y_len <= 0:
++            seq_y_len = 1
++
++        seq_y = np.full((seq_y_len, 1), y, dtype=np.float32)
++
++        # Build time marks in the same general style as the original loader
++        df_x_stamp = pd.DataFrame({'date': pd.to_datetime(x_dates)})
++
++        if self.timeenc == 0:
++            df_x_stamp['month'] = df_x_stamp.date.apply(lambda row: row.month)
++            df_x_stamp['day'] = df_x_stamp.date.apply(lambda row: row.day)
++            df_x_stamp['weekday'] = df_x_stamp.date.apply(lambda row: row.weekday())
++            df_x_stamp['hour'] = 0  # daily data
++            seq_x_mark = df_x_stamp.drop(['date'], axis=1).values.astype(np.float32)
++        elif self.timeenc == 1:
++            seq_x_mark = time_features(
++                pd.to_datetime(df_x_stamp['date'].values), freq=self.freq
++            ).transpose(1, 0).astype(np.float32)
++        else:
++            raise ValueError(f"Unsupported timeenc={self.timeenc}")
++
++        last_date = pd.to_datetime(x_dates[-1])
++        future_dates = pd.date_range(
++            start=last_date,
++            periods=seq_y_len,
++            freq='D'
++        )
++
++        df_y_stamp = pd.DataFrame({'date': future_dates})
++
++        if self.timeenc == 0:
++            df_y_stamp['month'] = df_y_stamp.date.apply(lambda row: row.month)
++            df_y_stamp['day'] = df_y_stamp.date.apply(lambda row: row.day)
++            df_y_stamp['weekday'] = df_y_stamp.date.apply(lambda row: row.weekday())
++            df_y_stamp['hour'] = 0
++            seq_y_mark = df_y_stamp.drop(['date'], axis=1).values.astype(np.float32)
++        elif self.timeenc == 1:
++            seq_y_mark = time_features(
++                pd.to_datetime(df_y_stamp['date'].values), freq=self.freq
++            ).transpose(1, 0).astype(np.float32)
++        else:
++            raise ValueError(f"Unsupported timeenc={self.timeenc}")
++
++        return seq_x, seq_y, seq_x_mark, seq_y_mark
++
++    def __len__(self):
++        return len(self.samples)
++
++    def inverse_transform(self, data):
++        return self.scaler.inverse_transform(data)
++
++    def get_sample_meta(self, index):
++        _, y, x_dates, serial, end_date = self.samples[index]
++        return {
++            "serial_number": serial,
++            "end_date": str(end_date.date()),
++            "y_true": int(y),
++        }
+\ No newline at end of file
+diff --git a/dataset/prompt_bank/backblaze.txt b/dataset/prompt_bank/backblaze.txt
+new file mode 100644
+index 0000000..1fee3ec
+--- /dev/null
++++ b/dataset/prompt_bank/backblaze.txt
+@@ -0,0 +1,2 @@
++Backblaze hard drive telemetry dataset. Each sample is a multivariate daily time-series window of SMART statistics for a single disk. The task is binary classification: predict whether the disk will fail within the next 7 days based on the previous observation window.
++
+diff --git a/evaluate_results.py b/evaluate_results.py
+new file mode 100644
+index 0000000..466bb44
+--- /dev/null
++++ b/evaluate_results.py
+@@ -0,0 +1,66 @@
++import pandas as pd
++import numpy as np
++
++# DISK_MODEL = "TOSHIBA MG08ACA16TEY"
++DISK_MODEL = "WDC WUH722222ALE6L4" 
++CSV_PATH = f"./results/{DISK_MODEL}_inference.csv"
++
++df = pd.read_csv(CSV_PATH)
++
++# =========================
++# Basic counts
++# =========================
++y_true = df["y_true"].values
++y_pred = df["y_pred"].values
++
++TP = np.sum((y_true == 1) & (y_pred == 1))
++FP = np.sum((y_true == 0) & (y_pred == 1))
++TN = np.sum((y_true == 0) & (y_pred == 0))
++FN = np.sum((y_true == 1) & (y_pred == 0))
++
++print("Confusion Matrix:")
++print(f"TP={TP}, FP={FP}, TN={TN}, FN={FN}")
++
++# =========================
++# Metrics
++# =========================
++precision = TP / (TP + FP + 1e-12)
++recall = TP / (TP + FN + 1e-12)
++accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-12)
++f1 = 2 * precision * recall / (precision + recall + 1e-12)
++
++print("\nPoint-wise Metrics:")
++print(f"Precision: {precision:.4f}")
++print(f"Recall:    {recall:.4f}")
++print(f"Accuracy:  {accuracy:.4f}")
++print(f"F1:        {f1:.4f}")
++
++# =========================
++# Event-level Recall
++# =========================
++# 定义：
++# 对每个 serial，如果：
++#   存在 y_true == 1
++# 且 存在至少一个 (y_true == 1 且 y_pred == 1)
++# → 记为一个 TP event
++
++event_tp = 0
++event_total = 0
++
++for serial, g in df.groupby("serial_number"):
++    has_failure = (g["y_true"] == 1).any()
++    
++    if has_failure:
++        event_total += 1
++        
++        detected = ((g["y_true"] == 1) & (g["y_pred"] == 1)).any()
++        
++        if detected:
++            event_tp += 1
++
++event_recall = event_tp / (event_total + 1e-12)
++
++print("\nEvent-level Metrics:")
++print(f"Event-level TP: {event_tp}")
++print(f"Total failure serials: {event_total}")
++print(f"Event-level Recall: {event_recall:.4f}")
+\ No newline at end of file
+diff --git a/evaluate_results_threshold_sweep.py b/evaluate_results_threshold_sweep.py
+new file mode 100644
+index 0000000..b3e83d6
+--- /dev/null
++++ b/evaluate_results_threshold_sweep.py
+@@ -0,0 +1,79 @@
++import pandas as pd
++import numpy as np
++
++DISK_MODEL = "ST14000NM001G" 
++CSV_PATH = f"./results/{DISK_MODEL}_inference.csv"
++THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
++
++df = pd.read_csv(CSV_PATH)
++
++required_cols = ["serial_number", "y_true", "prob"]
++missing = [c for c in required_cols if c not in df.columns]
++if missing:
++    raise ValueError(f"Missing required columns in CSV: {missing}")
++
++
++def safe_div(a, b):
++    return a / b if b != 0 else 0.0
++
++
++rows = []
++
++for thr in THRESHOLDS:
++    y_true = df["y_true"].values.astype(int)
++    y_pred = (df["prob"].values >= thr).astype(int)
++
++    TP = int(np.sum((y_true == 1) & (y_pred == 1)))
++    FP = int(np.sum((y_true == 0) & (y_pred == 1)))
++    TN = int(np.sum((y_true == 0) & (y_pred == 0)))
++    FN = int(np.sum((y_true == 1) & (y_pred == 0)))
++
++    precision = safe_div(TP, TP + FP)
++    recall = safe_div(TP, TP + FN)
++    accuracy = safe_div(TP + TN, TP + TN + FP + FN)
++    f1 = safe_div(2 * precision * recall, precision + recall)
++
++    # Event-level recall
++    event_tp = 0
++    event_total = 0
++
++    tmp = df.copy()
++    tmp["y_pred_thr"] = y_pred
++
++    for serial, g in tmp.groupby("serial_number"):
++        has_failure = (g["y_true"] == 1).any()
++        if has_failure:
++            event_total += 1
++            detected = ((g["y_true"] == 1) & (g["y_pred_thr"] == 1)).any()
++            if detected:
++                event_tp += 1
++
++    event_recall = safe_div(event_tp, event_total)
++
++    rows.append({
++        "threshold": thr,
++        "TP": TP,
++        "FP": FP,
++        "TN": TN,
++        "FN": FN,
++        "precision": precision,
++        "recall": recall,
++        "accuracy": accuracy,
++        "f1": f1,
++        "event_tp": event_tp,
++        "event_total": event_total,
++        "event_recall": event_recall,
++    })
++
++result_df = pd.DataFrame(rows)
++
++print("\nThreshold sweep results:")
++print(result_df.to_string(index=False))
++
++best_f1_row = result_df.loc[result_df["f1"].idxmax()]
++print("\nBest threshold by F1:")
++print(best_f1_row.to_string())
++
++output_csv = "./results/threshold_sweep_results.csv"
++result_df.to_csv(output_csv, index=False)
++print(f"\nSaved threshold sweep results to: {output_csv}")
+\ No newline at end of file
+diff --git a/extract_adapter_from_old_ckpt.py b/extract_adapter_from_old_ckpt.py
+new file mode 100644
+index 0000000..6d69236
+--- /dev/null
++++ b/extract_adapter_from_old_ckpt.py
+@@ -0,0 +1,33 @@
++import os
++import torch
++
++OLD_CKPT = "./ckpt/time_llm_fast_final.pth"
++NEW_CKPT = "./ckpt/time_llm_fast_final_adapter_only.pth"
++
++state = torch.load(OLD_CKPT, map_location="cpu")
++
++print(f"Loaded checkpoint from: {OLD_CKPT}")
++print(f"Total keys in old checkpoint: {len(state)}")
++
++adapter_state = {}
++llm_keys = []
++adapter_keys = []
++
++for k, v in state.items():
++    if k.startswith("llm_model."):
++        llm_keys.append(k)
++    else:
++        adapter_state[k] = v
++        adapter_keys.append(k)
++
++print(f"LLM keys filtered out: {len(llm_keys)}")
++print(f"Adapter/non-LLM keys kept: {len(adapter_keys)}")
++
++print("\nFirst 20 kept keys:")
++for k in adapter_keys[:20]:
++    print("  ", k)
++
++os.makedirs(os.path.dirname(NEW_CKPT), exist_ok=True)
++torch.save(adapter_state, NEW_CKPT)
++
++print(f"\nSaved adapter-only checkpoint to: {NEW_CKPT}")
+\ No newline at end of file
+diff --git a/inference_from_checkpoint.py b/inference_from_checkpoint.py
+new file mode 100644
+index 0000000..fa9becc
+--- /dev/null
++++ b/inference_from_checkpoint.py
+@@ -0,0 +1,365 @@
++import os
++import random
++import pickle
++import numpy as np
++import pandas as pd
++import torch
++import json
++
++from models import TimeLLM
++
++
++FEATURE_JSON_PATH = "" # TODO: path to the feature json file
++DISK_MODEL = "HGST HUH721212ALN604" 
++
++
++# =========================
++# Config
++# =========================
++CKPT_PATH = f"./ckpt/time_llm_{DISK_MODEL}.pth"
++TEST_CSV = "" # TODO: path to the csv of the DISK_MODEL
++LOCAL_INFERENCE_CSV = "" # TODO: path to the csv file of the DISK_MODEL test dataset
++USE_LOCAL_INFERENCE_CSV = LOCAL_INFERENCE_CSV is not None
++OUTPUT_CSV = f"./results/{DISK_MODEL}_inference.csv"
++
++RANDOM_SEED = 42
++NUM_SERIALS = 10
++SEQ_LEN = 14
++ALLOW_SHORT_HISTORY = True
++PRED_LEN = 1
++LABEL_LEN = 0
++BATCH_SIZE = 64
++
++TARGET_COL = "failure_7d"
++
++
++# =========================
++# Args for TimeLLM
++# =========================
++class Args:
++    def __init__(self):
++        self.task_name = "classification"
++
++        self.seq_len = SEQ_LEN
++        self.label_len = LABEL_LEN
++        self.pred_len = PRED_LEN
++
++        self.enc_in = None
++        self.dec_in = None
++        self.c_out = 1
++
++        self.d_model = 16
++        self.n_heads = 8
++        self.e_layers = 2
++        self.d_layers = 1
++        self.d_ff = 32
++        self.factor = 1
++        self.dropout = 0.1
++        self.embed = "timeF"
++        self.activation = "gelu"
++        self.output_attention = False
++
++        self.patch_len = 16
++        self.stride = 8
++        self.prompt_domain = 0
++
++        self.llm_model = "GPT2"
++        self.llm_dim = 768
++        self.llm_layers = 6
++
++        self.model = "TimeLLM"
++        self.model_id = "inference"
++        self.model_comment = "inference"
++        self.des = "inference"
++
++        self.use_amp = False
++        self.content = "Backblaze disk failure prediction"
++
++
++# =========================
++# Helpers
++# =========================
++def build_time_features(dt_index: pd.DatetimeIndex) -> np.ndarray:
++    """
++    Match the simple 3-column time marks you were using:
++    month / day / weekday
++    shape: [seq_len, 3]
++    """
++    return np.stack(
++        [
++            dt_index.month.values,
++            dt_index.day.values,
++            dt_index.weekday.values,
++        ],
++        axis=1,
++    ).astype(np.float32)
++
++
++def build_samples_from_subset(df: pd.DataFrame):
++    """
++    Build sliding-window samples from selected serials.
++
++    Default behavior in this script is to produce one inference sample per row.
++    For the first few rows of each serial, when there are fewer than SEQ_LEN
++    historical rows available, the sequence is left-padded by repeating the
++    earliest available row so the model still receives a fixed-length input.
++
++    Returns a list of dicts with tensors-ready numpy arrays + metadata.
++    """
++    samples = []
++
++    df = df.copy()
++    df["date"] = pd.to_datetime(df["date"])
++    df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
++
++    skipped_short_serials = 0
++
++    for serial, g in df.groupby("serial_number"):
++        g = g.sort_values("date").reset_index(drop=True)
++
++        if len(g) < SEQ_LEN and not ALLOW_SHORT_HISTORY:
++            skipped_short_serials += 1
++            continue
++
++        feat_arr = g[FEATURE_COLS].astype(np.float32).fillna(0.0).values
++        label_arr = g[TARGET_COL].fillna(0).astype(np.float32).values
++        date_arr = pd.to_datetime(g["date"])
++
++        if ALLOW_SHORT_HISTORY:
++            end_indices = range(len(g))
++        else:
++            end_indices = range(SEQ_LEN - 1, len(g))
++
++        for end_idx in end_indices:
++            start_idx = max(0, end_idx - SEQ_LEN + 1)
++
++            seq_x = feat_arr[start_idx:end_idx + 1]
++            x_dates = date_arr.iloc[start_idx:end_idx + 1]
++            y_true = float(label_arr[end_idx])
++            end_date = x_dates.iloc[-1]
++
++            current_len = seq_x.shape[0]
++            if current_len < SEQ_LEN:
++                pad_len = SEQ_LEN - current_len
++                pad_feat = np.repeat(seq_x[:1], pad_len, axis=0)
++                seq_x = np.concatenate([pad_feat, seq_x], axis=0)
++
++                first_date = x_dates.iloc[0]
++                pad_dates = pd.DatetimeIndex([first_date] * pad_len)
++                x_dates = pd.DatetimeIndex(pad_dates.tolist() + list(pd.DatetimeIndex(x_dates)))
++            else:
++                x_dates = pd.DatetimeIndex(x_dates)
++
++            seq_x_mark = build_time_features(x_dates)
++            seq_y_mark = build_time_features(pd.DatetimeIndex([end_date]))
++
++            samples.append(
++                {
++                    "serial_number": serial,
++                    "end_date": str(end_date.date()),
++                    "seq_x": seq_x,
++                    "seq_x_mark": seq_x_mark,
++                    "seq_y_mark": seq_y_mark,
++                    "y_true": int(y_true),
++                }
++            )
++
++    if skipped_short_serials > 0:
++        print(f"Skipped {skipped_short_serials} short serials because ALLOW_SHORT_HISTORY is False")
++
++    return samples
++
++
++# Helper: batchify_samples and collate_batch
++def batchify_samples(samples, batch_size):
++    """
++    Yield mini-batches of prebuilt sliding-window samples.
++    """
++    for start in range(0, len(samples), batch_size):
++        yield samples[start:start + batch_size]
++
++
++def collate_batch(batch):
++    """
++    Convert a list of sample dicts into batched tensors plus metadata.
++    """
++    seq_x = torch.tensor(np.stack([x["seq_x"] for x in batch]), dtype=torch.float32)
++    seq_x_mark = torch.tensor(np.stack([x["seq_x_mark"] for x in batch]), dtype=torch.float32)
++    seq_y_mark = torch.tensor(np.stack([x["seq_y_mark"] for x in batch]), dtype=torch.float32)
++
++    metadata = [
++        {
++            "serial_number": x["serial_number"],
++            "end_date": x["end_date"],
++            "y_true": x["y_true"],
++        }
++        for x in batch
++    ]
++
++    return seq_x, seq_x_mark, seq_y_mark, metadata
++
++
++def load_model():
++    args = Args()
++    args.enc_in = len(FEATURE_COLS)
++    args.dec_in = len(FEATURE_COLS)
++    model = TimeLLM.Model(args)
++
++    state = torch.load(CKPT_PATH, map_location="cpu")
++    model.load_state_dict(state, strict=True)
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    model = model.to(device)
++
++    print("\nLoaded full GPT2 checkpoint successfully")
++    print(f"Model device: {next(model.parameters()).device}")
++    model.eval()
++    return model, args
++
++
++def load_inference_dataframe():
++    """
++    Load either:
++    1) a user-provided local csv for full inference, or
++    2) the default test csv.
++
++    When LOCAL_INFERENCE_CSV is provided, inference is run directly on that file,
++    without any additional serial sampling inside this script.
++    """
++    csv_path = LOCAL_INFERENCE_CSV if USE_LOCAL_INFERENCE_CSV else TEST_CSV
++    df = pd.read_csv(csv_path)
++    print(f"df length: {len(df)}")
++    return df
++
++
++# =========================
++# Main
++# =========================
++def main():
++    random.seed(RANDOM_SEED)
++    np.random.seed(RANDOM_SEED)
++
++    with open(FEATURE_JSON_PATH, "r") as f:
++        feature_map = json.load(f)
++
++    if DISK_MODEL not in feature_map:
++        raise ValueError(f"{DISK_MODEL} not found in feature json")
++
++    selected_base = feature_map[DISK_MODEL]
++    global FEATURE_COLS
++    FEATURE_COLS = [f"{x}_raw" for x in selected_base]
++
++    print(f"[{DISK_MODEL}] using {len(FEATURE_COLS)} features")
++
++    os.makedirs("./results", exist_ok=True)
++
++    print("Loading test.csv ...")
++    df = load_inference_dataframe()
++
++    df["date"] = pd.to_datetime(df["date"])
++
++    # only keep required columns if present
++    required_cols = ["date", "serial_number", TARGET_COL] + FEATURE_COLS
++    missing = [c for c in required_cols if c not in df.columns]
++    if missing:
++        raise ValueError(f"Missing required columns: {missing}")
++
++    if USE_LOCAL_INFERENCE_CSV:
++        df_subset = df.copy()
++        print(f"Using local inference csv with {len(df_subset)} rows")
++        print(f"Distinct serials: {df_subset['serial_number'].nunique()}")
++        print(f"Date range: {df_subset['date'].min()} -> {df_subset['date'].max()}")
++        print("Running full inference on all rows in the provided csv")
++    else:
++        failure_serials = df.loc[df["failure"] == 1, "serial_number"].drop_duplicates().tolist()
++        healthy_serials = df.loc[~df["serial_number"].isin(failure_serials), "serial_number"].drop_duplicates().tolist()
++
++        num_failure = min(5, len(failure_serials))
++        num_healthy = min(5, len(healthy_serials))
++
++        chosen_failure = random.sample(failure_serials, num_failure)
++        chosen_healthy = random.sample(healthy_serials, num_healthy)
++
++        chosen_serials = chosen_failure + chosen_healthy
++        random.shuffle(chosen_serials)
++
++        print(f"Chosen failure serials: {chosen_failure}")
++        print(f"Chosen healthy serials: {chosen_healthy}")
++
++        df_subset = df[df["serial_number"].isin(chosen_serials)].copy()
++
++    print("Building inference samples ...")
++    if USE_LOCAL_INFERENCE_CSV and ALLOW_SHORT_HISTORY:
++        print("ALLOW_SHORT_HISTORY=True: building one inference sample per row with left padding for early rows")
++    else:
++        print(f"ALLOW_SHORT_HISTORY={ALLOW_SHORT_HISTORY}: using standard sliding-window behavior")
++
++    samples = build_samples_from_subset(df_subset)
++    print(f"Built {len(samples)} inference samples")
++
++    if USE_LOCAL_INFERENCE_CSV:
++        print(f"Local csv rows: {len(df_subset)}")
++        print(f"Difference (rows - samples): {len(df_subset) - len(samples)}")
++
++    if len(samples) == 0:
++        raise ValueError(
++            f"No inference samples were built. Ensure each serial has at least {SEQ_LEN} rows."
++        )
++
++    print("Loading model from checkpoint ...")
++    model, args = load_model()
++
++    # For your current PHI4 4-bit setup, device is determined by model internals
++    model.eval()
++
++    results = []
++    model_device = next(model.parameters()).device
++    print(f"Running batched inference with batch_size={BATCH_SIZE} on {model_device}")
++
++    if args.label_len > 0:
++        raise NotImplementedError("This inference script assumes label_len == 0")
++
++    with torch.no_grad():
++        processed = 0
++        for batch in batchify_samples(samples, BATCH_SIZE):
++            seq_x, seq_x_mark, seq_y_mark, metadata = collate_batch(batch)
++
++            seq_x = seq_x.to(model_device, non_blocking=True)
++            seq_x_mark = seq_x_mark.to(model_device, non_blocking=True)
++            seq_y_mark = seq_y_mark.to(model_device, non_blocking=True)
++
++            dec_inp = torch.zeros(
++                (seq_x.size(0), args.pred_len, 1),
++                dtype=torch.float32,
++                device=model_device,
++            )
++
++            outputs = model(seq_x, seq_x_mark, dec_inp, seq_y_mark)
++            logits = outputs.detach().float().cpu().view(-1).numpy()
++            probs = torch.sigmoid(outputs).detach().float().cpu().view(-1).numpy()
++
++            for meta, logit, prob in zip(metadata, logits, probs):
++                results.append(
++                    {
++                        "serial_number": meta["serial_number"],
++                        "end_date": meta["end_date"],
++                        "y_true": meta["y_true"],
++                        "logit": float(logit),
++                        "prob": float(prob),
++                        "y_pred": int(prob >= 0.5),
++                    }
++                )
++
++            processed += len(batch)
++            if processed % 512 == 0 or processed == len(samples):
++                print(f"Inferenced {processed}/{len(samples)} samples")
++
++    df_out = pd.DataFrame(results)
++    df_out.to_csv(OUTPUT_CSV, index=False)
++
++    print(f"Saved inference results to: {OUTPUT_CSV}")
++    print(df_out.head())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/inference_from_checkpoint_alibaba_ssd.py b/inference_from_checkpoint_alibaba_ssd.py
+new file mode 100644
+index 0000000..5acadc6
+--- /dev/null
++++ b/inference_from_checkpoint_alibaba_ssd.py
+@@ -0,0 +1,406 @@
++import os
++import random
++import pickle
++import numpy as np
++import pandas as pd
++import torch
++import json
++
++from models import TimeLLM
++
++
++FEATURE_JSON_PATH = "" # TODO: path to the feature json file
++DISK_MODEL = "HGST HUH721212ALN604" 
++
++
++# =========================
++# Config
++# =========================
++CKPT_PATH = f"./ckpt/time_llm_{DISK_MODEL}.pth"
++TEST_CSV = "" # TODO: path to the csv of the DISK_MODEL
++LOCAL_INFERENCE_CSV = "" # TODO: path to the csv file of the DISK_MODEL test dataset
++USE_LOCAL_INFERENCE_CSV = LOCAL_INFERENCE_CSV is not None
++OUTPUT_CSV = f"./results/{DISK_MODEL}_inference.csv"
++
++RANDOM_SEED = 42
++NUM_SERIALS = 10
++SEQ_LEN = 14
++ALLOW_SHORT_HISTORY = True
++PRED_LEN = 1
++LABEL_LEN = 0
++BATCH_SIZE = 32
++
++TARGET_COL = "failure_7d"
++
++
++# =========================
++# Args for TimeLLM
++# =========================
++class Args:
++    def __init__(self):
++        self.task_name = "classification"
++
++        self.seq_len = SEQ_LEN
++        self.label_len = LABEL_LEN
++        self.pred_len = PRED_LEN
++
++        self.enc_in = None
++        self.dec_in = None
++        self.c_out = 1
++
++        self.d_model = 16
++        self.n_heads = 8
++        self.e_layers = 2
++        self.d_layers = 1
++        self.d_ff = 32
++        self.factor = 1
++        self.dropout = 0.1
++        self.embed = "timeF"
++        self.activation = "gelu"
++        self.output_attention = False
++
++        self.patch_len = 16
++        self.stride = 8
++        self.prompt_domain = 0
++
++        self.llm_model = "GPT2"
++        self.llm_dim = 768
++        self.llm_layers = 6
++
++        self.model = "TimeLLM"
++        self.model_id = "inference"
++        self.model_comment = "inference"
++        self.des = "inference"
++
++        self.use_amp = False
++        self.content = "Backblaze disk failure prediction"
++
++
++# =========================
++# Helpers
++# =========================
++def build_time_features(dt_index: pd.DatetimeIndex) -> np.ndarray:
++    """
++    Match the simple 3-column time marks you were using:
++    month / day / weekday
++    shape: [seq_len, 3]
++    """
++    return np.stack(
++        [
++            dt_index.month.values,
++            dt_index.day.values,
++            dt_index.weekday.values,
++        ],
++        axis=1,
++    ).astype(np.float32)
++
++
++def build_samples_from_subset(df: pd.DataFrame):
++    """
++    Build sliding-window samples from selected serials.
++
++    Default behavior in this script is to produce one inference sample per row.
++    For the first few rows of each serial, when there are fewer than SEQ_LEN
++    historical rows available, the sequence is left-padded by repeating the
++    earliest available row so the model still receives a fixed-length input.
++
++    Returns a list of dicts with tensors-ready numpy arrays + metadata.
++    """
++    samples = []
++
++    df = df.copy()
++    df["date"] = pd.to_datetime(df["date"])
++    df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
++
++    skipped_short_serials = 0
++
++    for serial, g in df.groupby("serial_number"):
++        g = g.sort_values("date").reset_index(drop=True)
++
++        if len(g) < SEQ_LEN and not ALLOW_SHORT_HISTORY:
++            skipped_short_serials += 1
++            continue
++
++        feat_arr = g.reindex(columns=FEATURE_COLS, fill_value=0.0).astype(np.float32).fillna(0.0).values
++        label_arr = g[TARGET_COL].fillna(0).astype(np.float32).values
++        date_arr = pd.to_datetime(g["date"])
++
++        if ALLOW_SHORT_HISTORY:
++            end_indices = range(len(g))
++        else:
++            end_indices = range(SEQ_LEN - 1, len(g))
++
++        for end_idx in end_indices:
++            start_idx = max(0, end_idx - SEQ_LEN + 1)
++
++            seq_x = feat_arr[start_idx:end_idx + 1]
++            x_dates = date_arr.iloc[start_idx:end_idx + 1]
++            y_true = float(label_arr[end_idx])
++            end_date = x_dates.iloc[-1]
++
++            current_len = seq_x.shape[0]
++            if current_len < SEQ_LEN:
++                pad_len = SEQ_LEN - current_len
++                pad_feat = np.repeat(seq_x[:1], pad_len, axis=0)
++                seq_x = np.concatenate([pad_feat, seq_x], axis=0)
++
++                first_date = x_dates.iloc[0]
++                pad_dates = pd.DatetimeIndex([first_date] * pad_len)
++                x_dates = pd.DatetimeIndex(pad_dates.tolist() + list(pd.DatetimeIndex(x_dates)))
++            else:
++                x_dates = pd.DatetimeIndex(x_dates)
++
++            seq_x_mark = build_time_features(x_dates)
++            seq_y_mark = build_time_features(pd.DatetimeIndex([end_date]))
++
++            samples.append(
++                {
++                    "serial_number": serial,
++                    "end_date": str(end_date.date()),
++                    "seq_x": seq_x,
++                    "seq_x_mark": seq_x_mark,
++                    "seq_y_mark": seq_y_mark,
++                    "y_true": int(y_true),
++                }
++            )
++
++    if skipped_short_serials > 0:
++        print(f"Skipped {skipped_short_serials} short serials because ALLOW_SHORT_HISTORY is False")
++
++    return samples
++
++
++# Helper: batchify_samples and collate_batch
++def batchify_samples(samples, batch_size):
++    """
++    Yield mini-batches of prebuilt sliding-window samples.
++    """
++    for start in range(0, len(samples), batch_size):
++        yield samples[start:start + batch_size]
++
++
++def collate_batch(batch):
++    """
++    Convert a list of sample dicts into batched tensors plus metadata.
++    """
++    seq_x = torch.tensor(np.stack([x["seq_x"] for x in batch]), dtype=torch.float32)
++    seq_x_mark = torch.tensor(np.stack([x["seq_x_mark"] for x in batch]), dtype=torch.float32)
++    seq_y_mark = torch.tensor(np.stack([x["seq_y_mark"] for x in batch]), dtype=torch.float32)
++
++    metadata = [
++        {
++            "serial_number": x["serial_number"],
++            "end_date": x["end_date"],
++            "y_true": x["y_true"],
++        }
++        for x in batch
++    ]
++
++    return seq_x, seq_x_mark, seq_y_mark, metadata
++
++
++def load_model():
++    args = Args()
++    args.enc_in = len(FEATURE_COLS)
++    args.dec_in = len(FEATURE_COLS)
++    model = TimeLLM.Model(args)
++    print(f"[INFO] Building model with enc_in={args.enc_in}, dec_in={args.dec_in}")
++
++    state = torch.load(CKPT_PATH, map_location="cpu")
++    try:
++        model.load_state_dict(state, strict=True)
++    except RuntimeError as e:
++        ckpt_shape = None
++        current_shape = None
++        if "output_projection.proj.weight" in state:
++            ckpt_shape = tuple(state["output_projection.proj.weight"].shape)
++        try:
++            current_shape = tuple(model.state_dict()["output_projection.proj.weight"].shape)
++        except Exception:
++            current_shape = None
++
++        raise RuntimeError(
++            f"Failed to load checkpoint due to architecture mismatch. "
++            f"Checkpoint output_projection.proj.weight shape={ckpt_shape}, "
++            f"current model shape={current_shape}, current FEATURE_COLS={len(FEATURE_COLS)}. "
++            f"This usually means the checkpoint was trained with a different feature set or feature count than the current inference script is using. "
++            f"Original error: {e}"
++        )
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    model = model.to(device)
++
++    print("\nLoaded full GPT2 checkpoint successfully")
++    print(f"Model device: {next(model.parameters()).device}")
++    model.eval()
++    return model, args
++
++
++def load_inference_dataframe():
++    """
++    Load either:
++    1) a user-provided local csv for full inference, or
++    2) the default test csv.
++
++    When LOCAL_INFERENCE_CSV is provided, inference is run directly on that file,
++    without any additional serial sampling inside this script.
++    """
++    csv_path = LOCAL_INFERENCE_CSV if USE_LOCAL_INFERENCE_CSV else TEST_CSV
++    usecols = None
++    if 'FEATURE_COLS' in globals():
++        candidate_cols = ["date", "serial_number", "failure", TARGET_COL] + FEATURE_COLS
++        usecols = lambda c: c in candidate_cols
++
++    df = pd.read_csv(csv_path, usecols=usecols)
++    print(f"df length: {len(df)}")
++    return df
++
++
++# =========================
++# Main
++# =========================
++def main():
++    random.seed(RANDOM_SEED)
++    np.random.seed(RANDOM_SEED)
++
++    with open(FEATURE_JSON_PATH, "r") as f:
++        feature_map = json.load(f)
++
++    if DISK_MODEL not in feature_map:
++        raise ValueError(f"{DISK_MODEL} not found in feature json")
++
++    selected_base = feature_map[DISK_MODEL]
++    global FEATURE_COLS
++    FEATURE_COLS = [f"{x}_raw" for x in selected_base]
++
++    print(f"[{DISK_MODEL}] using {len(FEATURE_COLS)} features")
++
++    os.makedirs("./results", exist_ok=True)
++
++    print("Loading test.csv ...")
++    df = load_inference_dataframe()
++
++    df["date"] = pd.to_datetime(df["date"])
++
++    # ensure required columns exist; for missing feature columns, create zero-filled placeholders
++    required_meta_cols = ["date", "serial_number", TARGET_COL]
++    missing_meta = [c for c in required_meta_cols if c not in df.columns]
++    if missing_meta:
++        raise ValueError(f"Missing required non-feature columns: {missing_meta}")
++
++    missing_feature_cols = [c for c in FEATURE_COLS if c not in df.columns]
++    if missing_feature_cols:
++        print(f"[WARN] Missing {len(missing_feature_cols)} feature columns in inference csv.")
++        print(f"[WARN] They will be dropped from FEATURE_COLS so the model input schema matches the actually available columns: {missing_feature_cols}")
++        FEATURE_COLS[:] = [c for c in FEATURE_COLS if c in df.columns]
++        print(f"[INFO] Effective feature count after dropping missing columns: {len(FEATURE_COLS)}")
++
++    # force numeric feature dtype and fill NaN after coercion
++    for c in FEATURE_COLS:
++        df[c] = pd.to_numeric(df[c], errors="coerce")
++    df[FEATURE_COLS] = df[FEATURE_COLS].fillna(0.0)
++
++    df = df[[col for col in df.columns if col not in FEATURE_COLS] + FEATURE_COLS]
++
++    if USE_LOCAL_INFERENCE_CSV:
++        df_subset = df.copy()
++        print(f"Using local inference csv with {len(df_subset)} rows")
++        print(f"Distinct serials: {df_subset['serial_number'].nunique()}")
++        print(f"Date range: {df_subset['date'].min()} -> {df_subset['date'].max()}")
++        print("Running full inference on all rows in the provided csv")
++    else:
++        if "failure" not in df.columns:
++            raise ValueError("Default test-mode sampling requires a 'failure' column, but it is missing from the csv.")
++
++        failure_serials = df.loc[df["failure"] == 1, "serial_number"].drop_duplicates().tolist()
++        healthy_serials = df.loc[~df["serial_number"].isin(failure_serials), "serial_number"].drop_duplicates().tolist()
++
++        num_failure = min(5, len(failure_serials))
++        num_healthy = min(5, len(healthy_serials))
++
++        chosen_failure = random.sample(failure_serials, num_failure)
++        chosen_healthy = random.sample(healthy_serials, num_healthy)
++
++        chosen_serials = chosen_failure + chosen_healthy
++        random.shuffle(chosen_serials)
++
++        print(f"Chosen failure serials: {chosen_failure}")
++        print(f"Chosen healthy serials: {chosen_healthy}")
++
++        df_subset = df[df["serial_number"].isin(chosen_serials)].copy()
++
++    print("Building inference samples ...")
++    if USE_LOCAL_INFERENCE_CSV and ALLOW_SHORT_HISTORY:
++        print("ALLOW_SHORT_HISTORY=True: building one inference sample per row with left padding for early rows")
++    else:
++        print(f"ALLOW_SHORT_HISTORY={ALLOW_SHORT_HISTORY}: using standard sliding-window behavior")
++
++    samples = build_samples_from_subset(df_subset)
++    print(f"Built {len(samples)} inference samples")
++
++    if USE_LOCAL_INFERENCE_CSV:
++        print(f"Local csv rows: {len(df_subset)}")
++        print(f"Difference (rows - samples): {len(df_subset) - len(samples)}")
++
++    if len(samples) == 0:
++        raise ValueError(
++            f"No inference samples were built. Ensure each serial has at least {SEQ_LEN} rows."
++        )
++
++    print("Loading model from checkpoint ...")
++    model, args = load_model()
++
++    # For your current PHI4 4-bit setup, device is determined by model internals
++    model.eval()
++
++    results = []
++    model_device = next(model.parameters()).device
++    print(f"Running batched inference with batch_size={BATCH_SIZE} on {model_device}")
++
++    if args.label_len > 0:
++        raise NotImplementedError("This inference script assumes label_len == 0")
++
++    with torch.no_grad():
++        processed = 0
++        for batch in batchify_samples(samples, BATCH_SIZE):
++            seq_x, seq_x_mark, seq_y_mark, metadata = collate_batch(batch)
++
++            seq_x = seq_x.to(model_device, non_blocking=True)
++            seq_x_mark = seq_x_mark.to(model_device, non_blocking=True)
++            seq_y_mark = seq_y_mark.to(model_device, non_blocking=True)
++
++            dec_inp = torch.zeros(
++                (seq_x.size(0), args.pred_len, 1),
++                dtype=torch.float32,
++                device=model_device,
++            )
++
++            outputs = model(seq_x, seq_x_mark, dec_inp, seq_y_mark)
++            logits = outputs.detach().float().cpu().view(-1).numpy()
++            probs = torch.sigmoid(outputs).detach().float().cpu().view(-1).numpy()
++
++            for meta, logit, prob in zip(metadata, logits, probs):
++                results.append(
++                    {
++                        "serial_number": meta["serial_number"],
++                        "end_date": meta["end_date"],
++                        "y_true": meta["y_true"],
++                        "logit": float(logit),
++                        "prob": float(prob),
++                        "y_pred": int(prob >= 0.5),
++                    }
++                )
++
++            processed += len(batch)
++            if processed % 512 == 0 or processed == len(samples):
++                print(f"Inferenced {processed}/{len(samples)} samples")
++
++    df_out = pd.DataFrame(results)
++    df_out.to_csv(OUTPUT_CSV, index=False)
++
++    print(f"Saved inference results to: {OUTPUT_CSV}")
++    print(df_out.head())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/models/TimeLLM.py b/models/TimeLLM.py
+index 604a8f4..bd02aaf 100644
+--- a/models/TimeLLM.py
++++ b/models/TimeLLM.py
+@@ -26,6 +26,19 @@ class FlattenHead(nn.Module):
+         x = self.dropout(x)
+         return x
+ 
++class ClassificationHead(nn.Module):
++    def __init__(self, n_vars, nf, head_dropout=0):
++        super().__init__()
++        self.flatten = nn.Flatten(start_dim=-2)   # [B, N, d_ff, patch_num] -> [B, N, nf]
++        self.dropout = nn.Dropout(head_dropout)
++        self.proj = nn.Linear(n_vars * nf, 1)
++
++    def forward(self, x):
++        x = self.flatten(x)          # [B, N, nf]
++        x = x.reshape(x.shape[0], -1)  # [B, N * nf]
++        x = self.dropout(x)
++        x = self.proj(x)             # [B, 1]
++        return x
+ 
+ class Model(nn.Module):
+ 
+@@ -150,6 +163,34 @@ class Model(nn.Module):
+                     trust_remote_code=True,
+                     local_files_only=False
+                 )
++        elif configs.llm_model == 'PHI4':
++            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
++
++            model_name = "microsoft/phi-4"
++            print("Loading Phi-4 model in 4-bit...")
++
++            self.tokenizer = AutoTokenizer.from_pretrained(
++                model_name,
++                trust_remote_code=True
++            )
++
++            if self.tokenizer.pad_token is None:
++                self.tokenizer.pad_token = self.tokenizer.eos_token
++
++            bnb_config = BitsAndBytesConfig(
++                load_in_4bit=True,
++                bnb_4bit_compute_dtype=torch.bfloat16,
++                bnb_4bit_use_double_quant=True,
++                bnb_4bit_quant_type="nf4"
++            )
++
++            self.llm_model = AutoModelForCausalLM.from_pretrained(
++                model_name,
++                trust_remote_code=True,
++                quantization_config=bnb_config,
++                device_map="auto",
++                low_cpu_mem_usage=True
++            )
+         else:
+             raise Exception('LLM model is not defined')
+ 
+@@ -183,16 +224,31 @@ class Model(nn.Module):
+         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
+         self.head_nf = self.d_ff * self.patch_nums
+ 
+-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+-            self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
+-                                                 head_dropout=configs.dropout)
++        if self.task_name == 'classification':
++            self.output_projection = ClassificationHead(
++                configs.enc_in, self.head_nf, head_dropout=configs.dropout
++            )
++        elif self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
++            self.output_projection = FlattenHead(
++                configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout
++            )
+         else:
+             raise NotImplementedError
+ 
+         self.normalize_layers = Normalize(configs.enc_in, affine=False)
+ 
++        self.runtime_device = self.word_embeddings.device
++
++        self.patch_embedding.to(self.runtime_device)
++        self.mapping_layer.to(self.runtime_device)
++        self.reprogramming_layer.to(self.runtime_device)
++        self.output_projection.to(self.runtime_device)
++        self.normalize_layers.to(self.runtime_device)
++
+     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
++        if self.task_name == 'classification':
++            return self.classification(x_enc, x_mark_enc, x_dec, x_mark_dec)
++        elif self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+             return dec_out[:, -self.pred_len:, :]
+         return None
+@@ -234,26 +290,92 @@ class Model(nn.Module):
+         prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
+         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
+ 
+-        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
++        # source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
++        source_embeddings = self.mapping_layer(self.word_embeddings.float().permute(1, 0)).permute(1, 0)
+ 
+         x_enc = x_enc.permute(0, 2, 1).contiguous()
+-        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
++        enc_out, n_vars = self.patch_embedding(x_enc.float())
+         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
+-        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
++        # dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
++        outputs = self.llm_model(inputs_embeds=llama_enc_out, output_hidden_states=True)
++        dec_out = outputs.hidden_states[-1]
+         dec_out = dec_out[:, :, :self.d_ff]
+ 
+         dec_out = torch.reshape(
+             dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
+         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
+ 
+-        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
++        # dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
++        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:].float())
++        
+         dec_out = dec_out.permute(0, 2, 1).contiguous()
+ 
+         dec_out = self.normalize_layers(dec_out, 'denorm')
+ 
+         return dec_out
+ 
++    def classification(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
++        x_enc = self.normalize_layers(x_enc, 'norm')
++
++        B, T, N = x_enc.size()
++        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
++
++        min_values = torch.min(x_enc, dim=1)[0]
++        max_values = torch.max(x_enc, dim=1)[0]
++        medians = torch.median(x_enc, dim=1).values
++        lags = self.calcute_lags(x_enc)
++        trends = x_enc.diff(dim=1).sum(dim=1)
++
++        prompt = []
++        for b in range(x_enc.shape[0]):
++            min_values_str = str(min_values[b].tolist()[0])
++            max_values_str = str(max_values[b].tolist()[0])
++            median_values_str = str(medians[b].tolist()[0])
++            lags_values_str = str(lags[b].tolist())
++            prompt_ = (
++                f"<|start_prompt|>Dataset description: {self.description}"
++                f"Task description: predict whether this hard disk will fail within the next 7 days "
++                f"given the previous {str(self.seq_len)} days of SMART statistics; "
++                "Input statistics: "
++                f"min value {min_values_str}, "
++                f"max value {max_values_str}, "
++                f"median value {median_values_str}, "
++                f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
++                f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
++            )
++            prompt.append(prompt_)
++
++        x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
++
++        prompt = self.tokenizer(
++            prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048
++        ).input_ids
++        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
++
++        # source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
++        source_embeddings = self.mapping_layer(self.word_embeddings.float().permute(1, 0)).permute(1, 0)
++
++        x_enc = x_enc.permute(0, 2, 1).contiguous()
++        enc_out, n_vars = self.patch_embedding(x_enc.float())
++        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
++
++        enc_out = enc_out.to(prompt_embeddings.dtype)
++        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
++        # dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
++        outputs = self.llm_model(inputs_embeds=llama_enc_out, output_hidden_states=True)
++        dec_out = outputs.hidden_states[-1]
++        dec_out = dec_out[:, :, :self.d_ff]
++
++        dec_out = torch.reshape(
++            dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1])
++        )
++        dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
++
++        # dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])   # [B, 1]
++        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:].float())
++        return dec_out
++
+     def calcute_lags(self, x_enc):
+         q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
+         k_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
+diff --git a/plot_pr_and_threshold_curves.py b/plot_pr_and_threshold_curves.py
+new file mode 100644
+index 0000000..1a9f919
+--- /dev/null
++++ b/plot_pr_and_threshold_curves.py
+@@ -0,0 +1,153 @@
++import os
++import numpy as np
++import pandas as pd
++import matplotlib.pyplot as plt
++
++
++# =========================
++# Config
++# =========================
++CSV_PATH = "./results/test_subset_inference.csv"
++OUTPUT_DIR = "./results/plots"
++THRESHOLDS = np.round(np.linspace(0.0, 1.0, 101), 2)
++
++
++def safe_div(a, b):
++    return a / b if b != 0 else 0.0
++
++
++def compute_point_metrics(y_true, y_pred):
++    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
++    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
++    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
++    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
++
++    precision = safe_div(tp, tp + fp)
++    recall = safe_div(tp, tp + fn)
++    accuracy = safe_div(tp + tn, tp + tn + fp + fn)
++    f1 = safe_div(2 * precision * recall, precision + recall)
++
++    return {
++        "TP": tp,
++        "FP": fp,
++        "TN": tn,
++        "FN": fn,
++        "precision": precision,
++        "recall": recall,
++        "accuracy": accuracy,
++        "f1": f1,
++    }
++
++
++def compute_event_recall(df, y_pred_col="y_pred_tmp"):
++    event_tp = 0
++    event_total = 0
++
++    for serial, g in df.groupby("serial_number"):
++        has_failure = (g["y_true"] == 1).any()
++        if has_failure:
++            event_total += 1
++            detected = ((g["y_true"] == 1) & (g[y_pred_col] == 1)).any()
++            if detected:
++                event_tp += 1
++
++    event_recall = safe_div(event_tp, event_total)
++    return event_tp, event_total, event_recall
++
++
++def threshold_sweep(df, thresholds):
++    y_true = df["y_true"].values.astype(int)
++    probs = df["prob"].values.astype(float)
++
++    rows = []
++
++    for thr in thresholds:
++        y_pred = (probs >= thr).astype(int)
++
++        metrics = compute_point_metrics(y_true, y_pred)
++
++        tmp = df.copy()
++        tmp["y_pred_tmp"] = y_pred
++        event_tp, event_total, event_recall = compute_event_recall(tmp, "y_pred_tmp")
++
++        rows.append({
++            "threshold": float(thr),
++            **metrics,
++            "event_tp": event_tp,
++            "event_total": event_total,
++            "event_recall": event_recall,
++        })
++
++    return pd.DataFrame(rows)
++
++
++def plot_pr_curve(result_df, output_path):
++    plt.figure(figsize=(7, 5))
++    plt.plot(result_df["recall"], result_df["precision"], marker="o", markersize=3)
++    plt.xlabel("Recall")
++    plt.ylabel("Precision")
++    plt.title("Precision-Recall Curve")
++    plt.grid(True, alpha=0.3)
++    plt.tight_layout()
++    plt.savefig(output_path, dpi=200)
++    plt.close()
++
++
++def plot_threshold_curves(result_df, output_path):
++    plt.figure(figsize=(8, 5))
++    plt.plot(result_df["threshold"], result_df["precision"], label="Precision")
++    plt.plot(result_df["threshold"], result_df["recall"], label="Recall")
++    plt.plot(result_df["threshold"], result_df["f1"], label="F1")
++    plt.plot(result_df["threshold"], result_df["accuracy"], label="Accuracy")
++    plt.plot(result_df["threshold"], result_df["event_recall"], label="Event Recall")
++    plt.xlabel("Threshold")
++    plt.ylabel("Metric Value")
++    plt.title("Threshold vs Metrics")
++    plt.legend()
++    plt.grid(True, alpha=0.3)
++    plt.tight_layout()
++    plt.savefig(output_path, dpi=200)
++    plt.close()
++
++
++def main():
++    os.makedirs(OUTPUT_DIR, exist_ok=True)
++
++    df = pd.read_csv(CSV_PATH)
++
++    required_cols = ["serial_number", "y_true", "prob"]
++    missing = [c for c in required_cols if c not in df.columns]
++    if missing:
++        raise ValueError(f"Missing required columns in CSV: {missing}")
++
++    result_df = threshold_sweep(df, THRESHOLDS)
++
++    threshold_csv = os.path.join(OUTPUT_DIR, "threshold_metrics.csv")
++    pr_png = os.path.join(OUTPUT_DIR, "pr_curve.png")
++    thr_png = os.path.join(OUTPUT_DIR, "threshold_performance_curve.png")
++
++    result_df.to_csv(threshold_csv, index=False)
++    plot_pr_curve(result_df, pr_png)
++    plot_threshold_curves(result_df, thr_png)
++
++    best_f1_row = result_df.loc[result_df["f1"].idxmax()]
++    best_precision_row = result_df.loc[result_df["precision"].idxmax()]
++    best_recall_row = result_df.loc[result_df["recall"].idxmax()]
++
++    print("\nSaved files:")
++    print(f"  {threshold_csv}")
++    print(f"  {pr_png}")
++    print(f"  {thr_png}")
++
++    print("\nBest threshold by F1:")
++    print(best_f1_row.to_string())
++
++    print("\nBest threshold by Precision:")
++    print(best_precision_row.to_string())
++
++    print("\nBest threshold by Recall:")
++    print(best_recall_row.to_string())
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/prepare_models.py b/prepare_models.py
+new file mode 100644
+index 0000000..90b013e
+--- /dev/null
++++ b/prepare_models.py
+@@ -0,0 +1,128 @@
++import os
++import glob
++import pandas as pd
++from multiprocessing import Pool, cpu_count
++import warnings
++
++warnings.filterwarnings("ignore")
++
++# =========================================================
++# Configuration
++# =========================================================
++DISK_MODELS = [
++    "HGST HUH721212ALN604",
++    "ST12000NM0008",
++    "TOSHIBA MG08ACA16TA",
++    "TOSHIBA MG07ACA14TA"
++]
++
++BASE_DIR = ""   # TODO: base directory 
++INPUT_PATTERN = "matched_raw_*.csv"
++INPUT_SUBDIR = "matched"
++OUTPUT_SUBDIR = "matched/time_llm"
++
++TRAIN_MONTHS = {
++    "2024-01", "2024-02", "2024-03", "2024-04", "2024-05", "2024-06",
++    "2024-07", "2024-08", "2024-09", "2024-10", "2024-11", "2024-12",
++}
++VAL_MONTHS = {"2025-01", "2025-02", "2025-03"}
++TEST_MONTHS = {"2025-04", "2025-05", "2025-06", "2025-07", "2025-08", "2025-09"}
++
++
++# =========================================================
++# Helpers
++# =========================================================
++def extract_month_from_filename(path: str) -> str:
++    name = os.path.basename(path)
++    stem = os.path.splitext(name)[0]
++    return stem.split("_")[-1]
++
++
++def add_failure_7d(group: pd.DataFrame) -> pd.DataFrame:
++    """为单个 serial 添加 failure_7d"""
++    group = group.sort_values("date").copy()
++    group["failure_7d"] = (
++        group["failure"]
++        .iloc[::-1]
++        .rolling(window=7, min_periods=1)
++        .max()
++        .iloc[::-1]
++        .astype(int)
++    )
++    return group
++
++
++def load_and_merge(paths: list, split_name: str, disk_model: str) -> pd.DataFrame:
++    if not paths:
++        raise ValueError(f"No files for split={split_name}, model={disk_model}")
++
++    print(f"[{disk_model}] Loading {split_name}: {len(paths)} files...")
++
++    # 串行读取（外层已并行，此处不需要再开 Pool）
++    dfs = [pd.read_csv(p) for p in paths]
++    df = pd.concat(dfs, ignore_index=True)
++
++    df["date"] = pd.to_datetime(df["date"])
++    df["failure"] = df["failure"].fillna(0).astype(int)
++    df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
++
++    print(f"[{disk_model}] {split_name}: Concat done, total rows = {len(df):,}")
++
++    # 计算 failure_7d
++    print(f"[{disk_model}] Computing failure_7d for {split_name}...")
++
++    df = (
++        df.groupby("serial_number", group_keys=False)
++        .apply(add_failure_7d)
++        .reset_index(drop=True)
++    )
++
++    positives = int(df["failure_7d"].sum())
++    print(f"[{disk_model}] {split_name} finished → rows={len(df):,}, positives={positives}\n")
++
++    return df
++
++
++def build_split_for_model(disk_model: str):
++    model_root = os.path.join(BASE_DIR, disk_model)
++    input_dir = os.path.join(model_root, INPUT_SUBDIR)
++    output_dir = os.path.join(model_root, OUTPUT_SUBDIR)
++    os.makedirs(output_dir, exist_ok=True)
++
++    csv_files = sorted(glob.glob(os.path.join(input_dir, INPUT_PATTERN)))
++    if not csv_files:
++        print(f"Warning: No files found for {disk_model}")
++        return
++
++    print("=" * 90)
++    print(f"Processing disk model: {disk_model}  |  Total files: {len(csv_files)}")
++
++    train_files = [p for p in csv_files if extract_month_from_filename(p) in TRAIN_MONTHS]
++    val_files   = [p for p in csv_files if extract_month_from_filename(p) in VAL_MONTHS]
++    test_files  = [p for p in csv_files if extract_month_from_filename(p) in TEST_MONTHS]
++
++    train_df = load_and_merge(train_files, "train", disk_model)
++    val_df   = load_and_merge(val_files,   "val",   disk_model)
++    test_df  = load_and_merge(test_files,  "test",  disk_model)
++
++    # 保存结果
++    train_df.to_csv(os.path.join(output_dir, "train.csv"), index=False)
++    val_df.to_csv(  os.path.join(output_dir, "val.csv"),   index=False)
++    test_df.to_csv( os.path.join(output_dir, "test.csv"),  index=False)
++
++    print(f"✓ [{disk_model}] All files saved to: {output_dir}\n")
++
++
++def main():
++    print(f"CPU cores available: {cpu_count()}")
++    print("Starting parallel processing across disk models...\n")
++
++    # 只在外层并行（每个磁盘型号一个进程）
++    with Pool(processes=min(len(DISK_MODELS), cpu_count() // 2 + 1)) as pool:   # 保守使用 CPU 核数
++        pool.map(build_split_for_model, DISK_MODELS)
++
++    print("=== All disk models processed successfully! ===")
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/run_main.py b/run_main.py
+index 1497e19..0a18e85 100644
+--- a/run_main.py
++++ b/run_main.py
+@@ -1,6 +1,7 @@
+ import argparse
+ import torch
+-from accelerate import Accelerator, DeepSpeedPlugin
++# from accelerate import Accelerator, DeepSpeedPlugin
++from accelerate import Accelerator
+ from accelerate import DistributedDataParallelKwargs
+ from torch import nn, optim
+ from torch.optim import lr_scheduler
+@@ -8,6 +9,7 @@ from tqdm import tqdm
+ 
+ from models import Autoformer, DLinear, TimeLLM
+ 
++from utils.tools import predict_test
+ from data_provider.data_factory import data_provider
+ import time
+ import random
+@@ -27,8 +29,9 @@ torch.manual_seed(fix_seed)
+ np.random.seed(fix_seed)
+ 
+ # basic config
+-parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
+-                    help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
++# parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
++#                     help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
++parser.add_argument('--task_name', type=str, default='classification', help='task name')
+ parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
+ parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
+ parser.add_argument('--model_comment', type=str, required=True, default='none', help='prefix when saving test results')
+@@ -40,6 +43,7 @@ parser.add_argument('--seed', type=int, default=2021, help='random seed')
+ parser.add_argument('--data', type=str, required=True, default='ETTm1', help='dataset type')
+ parser.add_argument('--root_path', type=str, default='./dataset', help='root path of the data file')
+ parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
++parser.add_argument('--disk_model', type=str, required=True, help='disk model name for feature selection')
+ parser.add_argument('--features', type=str, default='M',
+                     help='forecasting task, options:[M, S, MS]; '
+                          'M:multivariate predict multivariate, S: univariate predict univariate, '
+@@ -59,8 +63,8 @@ parser.add_argument('--pred_len', type=int, default=96, help='prediction sequenc
+ parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
+ 
+ # model define
+-parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
+-parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
++parser.add_argument('--enc_in', type=int, default=11, help='encoder input size')
++parser.add_argument('--dec_in', type=int, default=11, help='decoder input size')
+ parser.add_argument('--c_out', type=int, default=7, help='output size')
+ parser.add_argument('--d_model', type=int, default=16, help='dimension of model')
+ parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
+@@ -97,11 +101,18 @@ parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
+ parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
+ parser.add_argument('--llm_layers', type=int, default=6)
+ parser.add_argument('--percent', type=int, default=100)
++parser.add_argument('--fast_train_only', action='store_true', help='skip full val/test during training for fast checkpoint generation')
++parser.add_argument('--save_final_checkpoint', action='store_true', default=True, help='save final checkpoint for later inference')
++parser.add_argument('--final_checkpoint_name', type=str, default='time_llm_fast_final.pth', help='checkpoint filename saved under ./ckpt')
+ 
+ args = parser.parse_args()
++# ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
++# deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
++# accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
++
+ ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+-deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
+-accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
++# accelerator = Accelerator(cpu=True, kwargs_handlers=[ddp_kwargs])
++accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+ 
+ for ii in range(args.itr):
+     # setting record of experiments
+@@ -124,8 +135,15 @@ for ii in range(args.itr):
+         args.des, ii)
+ 
+     train_data, train_loader = data_provider(args, 'train')
+-    vali_data, vali_loader = data_provider(args, 'val')
+-    test_data, test_loader = data_provider(args, 'test')
++
++    args.enc_in = train_data.enc_in
++    args.dec_in = train_data.enc_in
++
++    vali_data, vali_loader = None, None
++    test_data, test_loader = None, None
++    if not args.fast_train_only:
++        vali_data, vali_loader = data_provider(args, 'val')
++        test_data, test_loader = data_provider(args, 'test')
+ 
+     if args.model == 'Autoformer':
+         model = Autoformer.Model(args).float()
+@@ -161,11 +179,19 @@ for ii in range(args.itr):
+                                             epochs=args.train_epochs,
+                                             max_lr=args.learning_rate)
+ 
+-    criterion = nn.MSELoss()
++    # criterion = nn.MSELoss()
++    pos_weight = torch.tensor([1], device=accelerator.device)
++    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+     mae_metric = nn.L1Loss()
+ 
+-    train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
+-        train_loader, vali_loader, test_loader, model, model_optim, scheduler)
++    if args.fast_train_only:
++        train_loader, model, model_optim, scheduler = accelerator.prepare(
++            train_loader, model, model_optim, scheduler)
++    else:
++        train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
++            train_loader, vali_loader, test_loader, model, model_optim, scheduler)
++    print("accelerator device:", accelerator.device)
++    print("model device:", next(model.parameters()).device)
+ 
+     if args.use_amp:
+         scaler = torch.cuda.amp.GradScaler()
+@@ -199,10 +225,8 @@ for ii in range(args.itr):
+                     else:
+                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+ 
+-                    f_dim = -1 if args.features == 'MS' else 0
+-                    outputs = outputs[:, -args.pred_len:, f_dim:]
+-                    batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+-                    loss = criterion(outputs, batch_y)
++                    batch_y_cls = batch_y[:, -1, 0].unsqueeze(1).to(accelerator.device)
++                    loss = criterion(outputs, batch_y_cls)
+                     train_loss.append(loss.item())
+             else:
+                 if args.output_attention:
+@@ -210,10 +234,8 @@ for ii in range(args.itr):
+                 else:
+                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+ 
+-                f_dim = -1 if args.features == 'MS' else 0
+-                outputs = outputs[:, -args.pred_len:, f_dim:]
+-                batch_y = batch_y[:, -args.pred_len:, f_dim:]
+-                loss = criterion(outputs, batch_y)
++                batch_y_cls = batch_y[:, -1, 0].unsqueeze(1)
++                loss = criterion(outputs, batch_y_cls)
+                 train_loss.append(loss.item())
+ 
+             if (i + 1) % 100 == 0:
+@@ -239,16 +261,62 @@ for ii in range(args.itr):
+ 
+         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+         train_loss = np.average(train_loss)
+-        vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
+-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+-        accelerator.print(
+-            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
+-                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
+ 
+-        early_stopping(vali_loss, model, path)
+-        if early_stopping.early_stop:
+-            accelerator.print("Early stopping")
+-            break
++        if args.fast_train_only:
++            accelerator.print(
++                "Epoch: {0} | Train Loss: {1:.7f} | fast_train_only=True (val/test skipped)".format(
++                    epoch + 1,
++                    train_loss,
++                )
++            )
++        else:
++            vali_loss, vali_metrics = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
++            test_loss, test_metrics = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
++
++            accelerator.print(
++                "Epoch: {0} | Train Loss: {1:.7f} | "
++                "Vali Loss: {2:.7f} | Test Loss: {3:.7f} | "
++                "Vali P/R/F1/MCC: {4:.4f}/{5:.4f}/{6:.4f}/{7:.4f} | "
++                "Test P/R/F1/MCC: {8:.4f}/{9:.4f}/{10:.4f}/{11:.4f}".format(
++                    epoch + 1,
++                    train_loss,
++                    vali_loss,
++                    test_loss,
++                    vali_metrics["precision"],
++                    vali_metrics["recall"],
++                    vali_metrics["f1"],
++                    vali_metrics["mcc"],
++                    test_metrics["precision"],
++                    test_metrics["recall"],
++                    test_metrics["f1"],
++                    test_metrics["mcc"],
++                )
++            )
++
++            if epoch == args.train_epochs - 1 and accelerator.is_local_main_process:
++                os.makedirs("./results", exist_ok=True)
++                output_csv = os.path.join("./results", setting + "_test_predictions.csv")
++                predict_test(
++                    args=args,
++                    accelerator=accelerator,
++                    model=model,
++                    test_data=test_data,
++                    test_loader=test_loader,
++                    output_csv=output_csv
++                )
++
++        if epoch == args.train_epochs - 1 and accelerator.is_local_main_process and args.save_final_checkpoint:
++            os.makedirs("./ckpt", exist_ok=True)
++            unwrapped_model = accelerator.unwrap_model(model)
++            ckpt_path = os.path.join("./ckpt", args.final_checkpoint_name)
++            torch.save(unwrapped_model.state_dict(), ckpt_path)
++            accelerator.print(f"Saved final checkpoint to {ckpt_path}")
++
++        if not args.fast_train_only:
++            early_stopping(vali_loss, model, path)
++            if early_stopping.early_stop:
++                accelerator.print("Early stopping")
++                break
+ 
+         if args.lradj != 'TST':
+             if args.lradj == 'COS':
+@@ -264,7 +332,7 @@ for ii in range(args.itr):
+             accelerator.print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+ 
+ accelerator.wait_for_everyone()
+-if accelerator.is_local_main_process:
++if accelerator.is_local_main_process and not args.fast_train_only:
+     path = './checkpoints'  # unique checkpoint saving path
+     del_files(path)  # delete checkpoint files
+     accelerator.print('success delete checkpoints')
+\ No newline at end of file
+diff --git a/scripts/backblaze_debug.sh b/scripts/backblaze_debug.sh
+new file mode 100644
+index 0000000..7584219
+--- /dev/null
++++ b/scripts/backblaze_debug.sh
+@@ -0,0 +1,80 @@
++BASE_DIR="${BASE_DIR:-/path/to/directory/of/train/data/}"
++SUBDIR_SUFFIX="${SUBDIR_SUFFIX}"
++
++if [ "$#" -eq 0 ]; then
++  echo "Usage: bash scripts/backblaze_debug.sh <disk_model1> [disk_model2 ...] [--extra run_main args]"
++  exit 1
++fi
++
++DISK_MODELS=()
++EXTRA_ARGS=()
++SEEN_FLAG=0
++
++for arg in "$@"; do
++  if [ "$SEEN_FLAG" -eq 0 ] && [[ "$arg" == --* ]]; then
++    SEEN_FLAG=1
++  fi
++
++  if [ "$SEEN_FLAG" -eq 0 ]; then
++    DISK_MODELS+=("$arg")
++  else
++    EXTRA_ARGS+=("$arg")
++  fi
++done
++
++if [ "${#DISK_MODELS[@]}" -eq 0 ]; then
++  echo "Error: no disk models provided."
++  exit 1
++fi
++
++mkdir -p ./ckpt
++
++for DISK_MODEL in "${DISK_MODELS[@]}"; do
++  ROOT_PATH="${BASE_DIR}/${DISK_MODEL}/${SUBDIR_SUFFIX}/"
++  CKPT_NAME="time_llm_${DISK_MODEL}.pth"
++  MODEL_ID="backblaze_${DISK_MODEL}_fast_train"
++
++  echo "============================================================"
++  echo "Running Time-LLM training for disk model: ${DISK_MODEL}"
++  echo "Root path: ${ROOT_PATH}"
++  echo "Checkpoint: ./ckpt/${CKPT_NAME}"
++  echo "============================================================"
++
++  python run_main.py \
++    --task_name classification \
++    --is_training 1 \
++    --model_id "${MODEL_ID}" \
++    --model_comment debug \
++    --model TimeLLM \
++    --data backblaze \
++    --root_path "${ROOT_PATH}" \
++    --disk_model "${DISK_MODEL}" \
++    --data_path unused.csv \
++    --features M \
++    --target failure_7d \
++    --freq d \
++    --seq_len 14 \
++    --label_len 0 \
++    --pred_len 1 \
++    --enc_in 11 \
++    --dec_in 11 \
++    --c_out 1 \
++    --d_model 16 \
++    --d_ff 32 \
++    --llm_model GPT2 \
++    --llm_dim 768 \
++    --llm_layers 6 \
++    --batch_size 1 \
++    --eval_batch_size 1 \
++    --train_epochs 2 \
++    --learning_rate 0.0001 \
++    --pct_start 0.2 \
++    --num_workers 4 \
++    --itr 1 \
++    --des debug \
++    --loss BCE \
++    --percent 100 \
++    --final_checkpoint_name "${CKPT_NAME}" \
++    "${EXTRA_ARGS[@]}"
++
++done
+\ No newline at end of file
+diff --git a/scripts/backblaze_debug_2gpu.sh b/scripts/backblaze_debug_2gpu.sh
+new file mode 100644
+index 0000000..2881473
+--- /dev/null
++++ b/scripts/backblaze_debug_2gpu.sh
+@@ -0,0 +1,33 @@
++accelerate launch --num_processes 2 run_main.py \
++  --task_name classification \
++  --is_training 1 \
++  --model_id backblaze_2gpu_debug \
++  --model_comment debug \
++  --model TimeLLM \
++  --data backblaze \
++  --root_path "TODO: path to the directory with train/val/test.csv" \
++  --data_path unused.csv \
++  --features M \
++  --target failure_7d \
++  --freq d \
++  --seq_len 30 \
++  --label_len 0 \
++  --pred_len 1 \
++  --enc_in 11 \
++  --dec_in 11 \
++  --c_out 1 \
++  --d_model 16 \
++  --d_ff 32 \
++  --llm_model GPT2 \
++  --llm_dim 768 \
++  --llm_layers 6 \
++  --batch_size 1 \
++  --eval_batch_size 1 \
++  --train_epochs 1 \
++  --learning_rate 0.0001 \
++  --pct_start 0.2 \
++  --num_workers 0 \
++  --itr 1 \
++  --des debug \
++  --loss BCE \
++  --percent 1
+\ No newline at end of file
+diff --git a/test_backblaze_forward.py b/test_backblaze_forward.py
+new file mode 100644
+index 0000000..de9c961
+--- /dev/null
++++ b/test_backblaze_forward.py
+@@ -0,0 +1,118 @@
++import torch
++import torch.nn as nn
++
++from data_provider.data_factory import data_provider
++from models import TimeLLM
++
++
++class Args:
++    def __init__(self):
++        # task / data
++        self.task_name = 'classification'
++        self.data = 'backblaze'
++        self.root_path = '' # TODO: path to the directory of train/val/test.csv
++        self.data_path = 'unused.csv'
++        self.features = 'M'
++        self.target = 'failure_7d'
++        self.freq = 'd'
++        self.embed = 'timeF'
++        self.percent = 1
++        # self.percent = 100
++        self.seasonal_patterns = None
++        self.num_workers = 0
++
++        # sequence
++        self.seq_len = 30
++        self.label_len = 0
++        self.pred_len = 1
++
++        # model dims
++        self.enc_in = 11
++        self.dec_in = 11
++        self.c_out = 1
++        self.d_model = 16
++        self.n_heads = 8
++        self.e_layers = 2
++        self.d_layers = 1
++        self.d_ff = 32
++        self.moving_avg = 25
++        self.factor = 1
++        self.dropout = 0.1
++        self.activation = 'gelu'
++        self.output_attention = False
++
++        # patch / llm
++        self.patch_len = 16
++        self.stride = 8
++        self.prompt_domain = 0
++        self.llm_model = 'PHI4'
++        self.llm_dim = 5120
++        self.llm_layers = 6
++
++        # loader / batch
++        self.batch_size = 1
++        self.eval_batch_size = 1
++
++        # unused but referenced by code
++        self.model = 'TimeLLM'
++        self.model_id = 'debug'
++        self.model_comment = 'debug'
++        self.checkpoints = './checkpoints/'
++        self.des = 'debug'
++        self.loss = 'BCE'
++        self.use_amp = False
++        self.learning_rate = 1e-4
++        self.train_epochs = 1
++        self.patience = 3
++        self.lradj = 'type1'
++        self.pct_start = 0.2
++        self.itr = 1
++        self.content = 'Backblaze disk failure prediction'
++
++
++def main():
++    args = Args()
++
++    print("Building dataset...")
++    train_data, train_loader = data_provider(args, 'train')
++    print("Dataset length:", len(train_data))
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    print("Using device:", device)
++
++    print("Building model...")
++    # model = TimeLLM.Model(args).float()
++    # model = TimeLLM.Model(args).float().to(device)
++    # model = TimeLLM.Model(args).to(device)
++    model = TimeLLM.Model(args)
++    device = model.word_embeddings.device
++    print("Using device:", device)
++    criterion = nn.BCEWithLogitsLoss()
++
++    batch_x, batch_y, batch_x_mark, batch_y_mark = next(iter(train_loader))
++    print("batch_x shape:", batch_x.shape)
++    print("batch_y shape:", batch_y.shape)
++    print("batch_x_mark shape:", batch_x_mark.shape)
++    print("batch_y_mark shape:", batch_y_mark.shape)
++
++    batch_x = batch_x.float().to(device)
++    batch_y = batch_y.float().to(device)
++    batch_x_mark = batch_x_mark.float().to(device)
++    batch_y_mark = batch_y_mark.float().to(device)
++
++    # keep original decoder input style for now
++    dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(device)
++    dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
++
++    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
++    print("outputs shape:", outputs.shape)
++
++    batch_y_cls = batch_y[:, -1, 0].unsqueeze(1).float().to(device)
++    print("batch_y_cls shape:", batch_y_cls.shape)
++
++    loss = criterion(outputs, batch_y_cls)
++    print("loss:", loss.item())
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_backblaze_loader.py b/test_backblaze_loader.py
+new file mode 100644
+index 0000000..93328fd
+--- /dev/null
++++ b/test_backblaze_loader.py
+@@ -0,0 +1,46 @@
++from data_provider.data_factory import data_provider
++
++
++class Args:
++    def __init__(self):
++        self.data = 'backblaze'
++        self.embed = 'timeF'
++        self.percent = 100
++        self.batch_size = 4
++        self.freq = 'd'
++        self.root_path = '' # TODO: path to the directory of train/val/test.csv
++        self.data_path = 'unused.csv'
++        self.seq_len = 30
++        self.label_len = 0
++        self.pred_len = 1
++        self.features = 'M'
++        self.target = 'failure_7d'
++        self.seasonal_patterns = None
++        self.num_workers = 0
++
++
++def main():
++    args = Args()
++
++    split = 'test' 
++    print(f"Building {split} dataset...")
++    dataset, loader = data_provider(args, split)
++
++    print("Dataset length:", len(dataset))
++    print("Feature columns count:", getattr(dataset, 'enc_in', 'N/A'))
++
++    batch = next(iter(loader))
++
++    print("\nBatch tensor shapes:")
++    for i, x in enumerate(batch):
++        print(f"item {i}: {x.shape}")
++
++    print("\nMeaning of each returned item:")
++    print("item 0 = seq_x")
++    print("item 1 = seq_y")
++    print("item 2 = seq_x_mark")
++    print("item 3 = seq_y_mark")
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/utils/tools.py b/utils/tools.py
+index b9ee19b..150d80e 100644
+--- a/utils/tools.py
++++ b/utils/tools.py
+@@ -1,12 +1,64 @@
+ import numpy as np
++import pandas as pd
+ import torch
+ import matplotlib.pyplot as plt
+ import shutil
+ 
++from sklearn.metrics import precision_score, recall_score, f1_score, matthews_corrcoef
+ from tqdm import tqdm
+ 
+ plt.switch_backend('agg')
+ 
++def predict_test(args, accelerator, model, test_data, test_loader, output_csv):
++    model.eval()
++
++    results = []
++    sample_idx = 0
++
++    with torch.no_grad():
++        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(test_loader)):
++            batch_x = batch_x.float().to(accelerator.device)
++            batch_y = batch_y.float()
++            batch_x_mark = batch_x_mark.float().to(accelerator.device)
++            batch_y_mark = batch_y_mark.float().to(accelerator.device)
++
++            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
++            dec_inp = torch.cat(
++                [batch_y[:, :args.label_len, :], dec_inp], dim=1
++            ).float().to(accelerator.device)
++
++            if args.output_attention:
++                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
++            else:
++                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
++
++            probs = torch.sigmoid(outputs).detach().cpu().numpy().reshape(-1)
++            preds = (probs >= 0.5).astype(int)
++            # true = batch_y[:, -1, 0].numpy().reshape(-1).astype(int)
++            true = batch_y[:, -1, 0].detach().cpu().numpy().reshape(-1).astype(int)
++            logits = outputs.detach().cpu().numpy().reshape(-1)
++
++            batch_size = len(probs)
++            for b in range(batch_size):
++                meta = test_data.get_sample_meta(sample_idx)
++
++                results.append({
++                    "serial_number": meta["serial_number"],
++                    "end_date": meta["end_date"],
++                    "y_true": int(true[b]),
++                    # "logit": float(outputs.detach().cpu().numpy().reshape(-1)[b]),
++                    "logit": float(logits[b]),
++                    "prob": float(probs[b]),
++                    "y_pred": int(preds[b]),
++                })
++                sample_idx += 1
++
++    df = pd.DataFrame(results)
++    df.to_csv(output_csv, index=False)
++    print(f"Saved test predictions to: {output_csv}")
++
++    model.train()
++    return df
+ 
+ def adjust_learning_rate(accelerator, optimizer, scheduler, epoch, args, printout=True):
+     if args.lradj == 'type1':
+@@ -136,8 +188,12 @@ def del_files(dir_path):
+ 
+ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
+     total_loss = []
+-    total_mae_loss = []
++    all_probs = []
++    all_preds = []
++    all_true = []
++
+     model.eval()
++
+     with torch.no_grad():
+         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
+             batch_x = batch_x.float().to(accelerator.device)
+@@ -148,9 +204,10 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
+ 
+             # decoder input
+             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
+-                accelerator.device)
+-            # encoder - decoder
++            dec_inp = torch.cat(
++                [batch_y[:, :args.label_len, :], dec_inp], dim=1
++            ).float().to(accelerator.device)
++
+             if args.use_amp:
+                 with torch.cuda.amp.autocast():
+                     if args.output_attention:
+@@ -165,26 +222,43 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
+ 
+             outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
+ 
+-            f_dim = -1 if args.features == 'MS' else 0
+-            outputs = outputs[:, -args.pred_len:, f_dim:]
+-            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+-
+-            pred = outputs.detach()
+-            true = batch_y.detach()
++            # classification label: [B, 1]
++            batch_y_cls = batch_y[:, -1, 0].unsqueeze(1).to(outputs.device)
+ 
+-            loss = criterion(pred, true)
++            loss = criterion(outputs, batch_y_cls)
++            total_loss.append(loss.item())
+ 
+-            mae_loss = mae_metric(pred, true)
++            probs = torch.sigmoid(outputs)
++            preds = (probs >= 0.5).float()
+ 
+-            total_loss.append(loss.item())
+-            total_mae_loss.append(mae_loss.item())
++            all_probs.append(probs.detach().cpu().numpy().reshape(-1))
++            all_preds.append(preds.detach().cpu().numpy().reshape(-1))
++            all_true.append(batch_y_cls.detach().cpu().numpy().reshape(-1))
+ 
+     total_loss = np.average(total_loss)
+-    total_mae_loss = np.average(total_mae_loss)
+ 
+-    model.train()
+-    return total_loss, total_mae_loss
++    all_probs = np.concatenate(all_probs)
++    all_preds = np.concatenate(all_preds)
++    all_true = np.concatenate(all_true)
++
++    precision = precision_score(all_true, all_preds, zero_division=0)
++    recall = recall_score(all_true, all_preds, zero_division=0)
++    f1 = f1_score(all_true, all_preds, zero_division=0)
+ 
++    try:
++        mcc = matthews_corrcoef(all_true, all_preds)
++    except Exception:
++        mcc = 0.0
++
++    metrics = {
++        "precision": precision,
++        "recall": recall,
++        "f1": f1,
++        "mcc": mcc,
++    }
++
++    model.train()
++    return total_loss, metrics
+ 
+ def test(args, accelerator, model, train_loader, vali_loader, criterion):
+     x, _ = train_loader.dataset.last_insample_window()
