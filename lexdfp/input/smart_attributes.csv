@@ -1,0 +1,84 @@
+name,description,desired,type,variation,notes,related,threshold
+smart_1_raw,Read Error Rate,context-dependent,HDD,Often stable; may increase slowly with age. Sudden jumps are concerning.,Raw value often includes both errors and total reads—encoding varies by vendor. Not always predictive.,"smart_7_raw,smart_195_raw,smart_204_raw",trend
+smart_2_raw,Throughput Performance,higher,HDD,Typically stable; obsolete on modern drives.,Rarely used today; mostly historical. Ignore on modern drives.,—,ignore
+smart_3_raw,Spin-Up Time,lower,HDD,Stable over life; increases if motor weakens.,Measured in milliseconds; rising values suggest aging motor or power issues.,"smart_10_raw,smart_207_raw,smart_208_raw",upper_pct:95
+smart_4_raw,Start/Stop Count,lower,HDD,Increases only when powered on/off; should be much less than power cycle count.,High counts normal in laptops or frequently cycled systems—but excessive cycling adds wear.,"smart_12_raw,smart_193_raw",upper_pct:95
+smart_5_raw,Reallocated Sector Count,lower,Both,Should be 0; any increase indicates media degradation.,Critical attribute. Non-zero means sectors have failed and been remapped.,"smart_196_raw,smart_197_raw,smart_198_raw,smart_187_raw",upper_pct:99
+smart_7_raw,Seek Error Rate,context-dependent,HDD,May be high but stable; sharp rise suggests mechanical issues.,Often a ratio (errors/total seeks). High raw doesn’t always mean failure—check trend.,"smart_1_raw,smart_204_raw",trend
+smart_8_raw,Seek Time Performance,higher,HDD,Obsolete; usually constant.,Not used in modern drives. Ignore unless on legacy hardware.,—,ignore
+smart_9_raw,Power-On Hours (POH),informational,Both,Steadily increases (~8760 hrs/year at 24/7). Not a failure predictor by itself.,Useful for estimating drive age and usage intensity.,"smart_12_raw,smart_241_raw",info
+smart_10_raw,Spin Retry Count,lower,HDD,Should be 0; any value indicates motor or power issues.,Retries occur when drive fails to spin up normally—sign of impending failure.,"smart_3_raw,smart_207_raw,smart_208_raw",soft_zero
+smart_11_raw,Calibration Retry Count,lower,HDD,Should be 0; non-zero suggests servo or mechanical problems.,Indicates drive had trouble calibrating head position—rare but serious.,"smart_203_raw,smart_227_raw",soft_zero
+smart_12_raw,Power Cycle Count,lower,Both,Increases with each power cycle; high counts normal in servers.,Compare with POH: frequent cycling in short time may stress components.,"smart_4_raw,smart_9_raw",upper_pct:95
+smart_13_raw,Soft Read Error Rate,context-dependent,HDD,Corrected errors; moderate values OK if stable.,Errors corrected via ECC—concerning only if rising rapidly.,"smart_195_raw,smart_204_raw",trend
+smart_22_raw,Helium Level,context-dependent,HDD,Should be stable; drop indicates seal leak (enterprise helium-filled drives).,"Only on enterprise helium-sealed drives (e.g., WD Ultrastar, Seagate Exos). A drop = potential failure.","smart_194_raw,smart_220_raw",trend
+smart_170_raw,Reserved Block Count / Program Fail Count,context-dependent,SSD,Varies by vendor: may show used or remaining blocks.,Samsung: shows used spares → lower = better. Others may show remaining → higher = better.,"smart_178_raw,smart_232_raw",model_specific
+smart_171_raw,Program Fail Count,lower,SSD,Should be 0; any increase is serious.,Failed NAND program (write) operations—indicates wear or defect.,"smart_175_raw,smart_181_raw",soft_zero
+smart_172_raw,Erase Fail Count,lower,SSD,Should be 0; indicates NAND wear or defect.,Failed block erasures—bad sign for SSD health.,"smart_176_raw,smart_182_raw",soft_zero
+smart_173_raw,Wear Leveling Count,context-dependent,SSD,May show max-min erase cycles (lower = better) or % life remaining (higher = better).,Samsung: lower = more even wear. Intel/Micron: may show % life left. Vendor-specific!,"smart_177_raw,smart_245_raw",model_specific
+smart_174_raw,Unexpected Power Loss Count,lower,Both,Increases only on unsafe shutdowns; should be rare.,Sudden power loss can corrupt data or FTL metadata—use UPS if frequent.,"smart_192_raw,smart_228_raw",upper_pct:95
+smart_175_raw,Program Fail Count (Total),lower,SSD,Cumulative; should be 0 or very low.,Total write failures over lifetime—any value warrants monitoring.,"smart_171_raw,smart_181_raw",soft_zero
+smart_176_raw,Erase Fail Count (Total),lower,SSD,Cumulative; should be 0.,Same as above for erase operations.,"smart_172_raw,smart_182_raw",soft_zero
+smart_177_raw,Wear Range Delta,lower,SSD,Lower = more even wear; increases slowly over time.,Difference between most/least worn blocks—high delta = poor wear leveling.,"smart_173_raw,smart_245_raw",upper_pct:95
+smart_178_raw,Used Reserved Block Count,lower,SSD,Increases as spare blocks are consumed; sudden rise = bad.,"Spare blocks being used—non-zero is normal late in life, but rapid increase = concern.","smart_170_raw,smart_232_raw,smart_234_raw",upper_pct:95
+smart_179_raw,Unused Reserved Block Count,higher,SSD,Decreases over time; should not reach 0.,Remaining spares—critical buffer before drive goes read-only.,"smart_180_raw,smart_232_raw",lower_pct:5
+smart_180_raw,Unused Reserved Block Count (Total),higher,SSD,Total spare blocks remaining; higher is better.,Similar to 179; total pool of spares.,"smart_179_raw,smart_234_raw",lower_pct:5
+smart_181_raw,Program Fail Count / Non-4K Aligned Access,lower,SSD,Should be low; depends on workload alignment.,"On some drives, reflects misaligned I/O—which increases write amplification.","smart_171_raw,smart_175_raw",soft_zero
+smart_182_raw,Erase Fail Count / Initial Bad Block,context-dependent,SSD,Initial bad blocks are normal; new failures are not.,All NAND has factory bad blocks—only new failures matter.,"smart_172_raw,smart_176_raw",trend
+smart_183_raw,SATA Downshift Count,lower,Both,Should be 0; occasional downshifts may be harmless (cable issue).,Drive fell back to SATA I/II due to signal integrity—check cables/power.,"smart_199_raw,smart_188_raw",hard_zero
+smart_184_raw,End-to-End Error,lower,HDD,Should be 0; any value indicates cache-to-disk mismatch.,IBM/Hitachi attribute—data corruption between cache and platter.,"smart_187_raw,smart_198_raw",hard_zero
+smart_187_raw,Reported Uncorrectable Errors,lower,Both,Critical: Should be 0; any value means data loss occurred.,High-priority warning. Data could not be recovered—backup and replace drive.,"smart_197_raw,smart_198_raw,smart_5_raw",hard_zero
+smart_188_raw,Command Timeout,lower,Both,"Should be 0; may indicate cable, power, or controller issues.",Commands took too long—often due to loose SATA cable or insufficient power.,"smart_199_raw,smart_183_raw",hard_zero
+smart_189_raw,High Fly Writes,lower,HDD,Should be 0; indicates head flying too high during writes.,Head wasn’t close enough to disk—writes may be unreliable.,"smart_205_raw,smart_206_raw",hard_zero
+smart_190_raw,Airflow Temperature / Temperature,lower,Both,Varies with environment; sustained >50°C is risky.,Some vendors use this for temp; others use 194. Avoid prolonged high temps.,smart_194_raw,absolute:55
+smart_191_raw,G-sense Error Rate,lower,HDD,Increases with physical shocks; should be 0 in stable environments.,Logs events where accelerometer detected shock (common in laptops).,"smart_212_raw,smart_254_raw,smart_220_raw",hard_zero
+smart_192_raw,Power-Off Retract Count,lower,HDD,Increases on unsafe shutdowns; normal if occasional.,Number of times heads were emergency-parked due to power loss.,"smart_174_raw,smart_228_raw",upper_pct:95
+smart_193_raw,Load/Unload Cycle Count,lower,HDD,Increases with head parking; high counts normal in laptops.,Heads unload to save power—rated for 300k–600k cycles. Excessive = wear.,"smart_4_raw,smart_225_raw",upper_pct:95
+smart_194_raw,Temperature Celsius,lower,Both,Typical range: 20–45°C; spikes under load are normal.,Most common temp attribute. Sustained >60°C reduces lifespan.,smart_190_raw,absolute:60
+smart_195_raw,Hardware ECC Recovered,context-dependent,HDD,Moderate values OK; rising trend indicates marginal sectors.,"Corrected sector errors—OK if stable, bad if climbing.","smart_1_raw,smart_13_raw,smart_204_raw",trend
+smart_196_raw,Reallocated Event Count,lower,Both,Should be 0; tracks reallocation attempts.,"Counts attempts to remap sectors—even if successful, it’s a red flag.","smart_5_raw,smart_197_raw",soft_zero
+smart_197_raw,Current Pending Sector Count,lower,Both,Critical: Should be 0; sectors awaiting remap—urgent if >0.,Imminent failure risk. These sectors failed read but haven’t been remapped yet.,"smart_5_raw,smart_198_raw,smart_187_raw",soft_zero
+smart_198_raw,Offline Uncorrectable,lower,Both,Critical: Should be 0; uncorrectable errors found offline.,Found during self-test—means permanent data loss on those sectors.,"smart_197_raw,smart_187_raw,smart_5_raw",hard_zero
+smart_199_raw,UDMA CRC Error Count,lower,Both,Should be 0; indicates cable or interface issues.,Almost always due to faulty SATA cable or port—try replacing cable first.,"smart_188_raw,smart_183_raw",hard_zero
+smart_200_raw,Write Error Rate / P/E Cycles,context-dependent,Both,On SSDs: may reflect wear—increases with use.,On HDDs: write errors. On SSDs: may show total program/erase cycles.,"smart_177_raw,smart_244_raw",model_specific
+smart_201_raw,Uncorrectable Soft Read Error Rate,lower,HDD,Should be 0; indicates read instability.,Errors that couldn’t be fixed by ECC—sector likely failing.,"smart_187_raw,smart_198_raw",hard_zero
+smart_202_raw,Data Address Mark Errors,lower,HDD,Should be 0; media or timing issue.,Rare; suggests timing or media flaw.,"smart_201_raw,smart_204_raw",hard_zero
+smart_203_raw,Run Out Cancel,lower,HDD,Should be 0; servo problem.,Servo couldn’t complete operation—mechanical issue.,"smart_11_raw,smart_227_raw",hard_zero
+smart_204_raw,Soft ECC Correction,context-dependent,HDD,Low/moderate is normal; rising trend is bad.,Similar to 195—corrected errors. Monitor trend.,"smart_195_raw,smart_13_raw",trend
+smart_205_raw,Thermal Asperity Rate,lower,HDD,Should be 0; head-disk contact due to heat.,Caused by thermal protrusion—can damage media.,"smart_189_raw,smart_194_raw",hard_zero
+smart_206_raw,Flying Height,context-dependent,HDD,Stable value expected; deviations indicate problems.,Measures head-to-disk distance—instability = risk of crash.,"smart_189_raw,smart_205_raw",trend
+smart_207_raw,Spin High Current,lower,HDD,Should be low; increases if motor degrades.,High current draw during spin-up = motor strain.,"smart_3_raw,smart_10_raw",upper_pct:95
+smart_208_raw,Spin Buzz,lower,HDD,Should be 0; failed spin attempts.,Drive tried and failed to spin—serious mechanical issue.,"smart_10_raw,smart_207_raw",hard_zero
+smart_209_raw,Offline Seek Performance,higher,HDD,Obsolete; usually constant.,Legacy attribute—ignore on modern drives.,—,ignore
+smart_210_raw,Vibration During Write,lower,HDD,Should be 0; indicates external vibration.,Logged if vibration sensor triggered during write.,"smart_211_raw,smart_191_raw",hard_zero
+smart_211_raw,Vibration During Read,lower,HDD,Should be 0.,Same as above for read operations.,"smart_210_raw,smart_191_raw",hard_zero
+smart_212_raw,Shock During Write,lower,HDD,Should be 0; physical shock events.,Sudden movement during write—risk of head crash.,"smart_191_raw,smart_254_raw",hard_zero
+smart_220_raw,Disk Shift,lower,HDD,Should be 0; mechanical misalignment.,Physical shift of platters—usually after impact.,"smart_191_raw,smart_212_raw",hard_zero
+smart_221_raw,G-sense Error Rate (Alt),lower,HDD,Same as smart_191_raw.,Alternate ID for shock events.,"smart_191_raw,smart_254_raw",hard_zero
+smart_222_raw,Loaded Hours,informational,HDD,Increases with head loaded time; normal in always-on drives.,Time heads were in contact with disk—complements load/unload count.,"smart_193_raw,smart_225_raw",info
+smart_223_raw,Load/Unload Retry Count,lower,HDD,Should be 0; retries indicate actuator issues.,Failed to park/unpark head—mechanical wear.,"smart_193_raw,smart_225_raw",hard_zero
+smart_224_raw,Load Friction,lower,HDD,Should be low; increases with wear.,Measures resistance during loading—rising = aging.,"smart_193_raw,smart_223_raw",upper_pct:95
+smart_225_raw,Load/Unload Cycle Count (Alt),lower,HDD,Same as smart_193_raw.,Alternate counter for head cycles.,"smart_193_raw,smart_222_raw",upper_pct:95
+smart_226_raw,Load-in Time,context-dependent,HDD,Cumulative; increases with usage.,Total time heads were loaded—usage metric.,"smart_222_raw,smart_193_raw",info
+smart_227_raw,Torque Amplification Count,lower,HDD,Should be 0; motor stress events.,Excessive torque needed—motor or bearing issue.,"smart_11_raw,smart_203_raw",hard_zero
+smart_228_raw,Power-Off Retract Count (Alt),lower,HDD,Same as smart_192_raw.,Alternate power-off retract counter.,"smart_192_raw,smart_174_raw",upper_pct:95
+smart_230_raw,Head Amplitude / SSD Life Curve,context-dependent,Both,On SSDs: may show % life used—increases with wear.,"On HDDs: head signal strength. On SSDs (e.g., Samsung): life used %.","smart_231_raw,smart_233_raw",model_specific
+smart_231_raw,SSD Life Left / Temperature,context-dependent,SSD,Often 100→0 scale; decreases with use. Some vendors show temperature.,Samsung: shows % life left → higher = better. Others may show temp. Always check vendor!,"smart_233_raw,smart_177_raw",model_specific
+smart_232_raw,Available Reserved Space,higher,SSD,Decreases over time; critical when near 0.,"Spare block pool—when exhausted, drive may go read-only.","smart_178_raw,smart_179_raw",lower_pct:5
+smart_233_raw,Media Wearout Indicator,higher,SSD,"Intel: 100 = new, 1 = worn out; decreases with use.",Intel/Micron standard: higher = healthier. Critical for endurance tracking.,"smart_231_raw,smart_244_raw",lower_pct:5
+smart_234_raw,Reserved Block Count,higher,SSD,Spare blocks remaining; higher is better.,Similar to 179/180—remaining spares.,"smart_179_raw,smart_232_raw",lower_pct:5
+smart_235_raw,NAND Written / Program Failure,context-dependent,SSD,If writes: increases; if failures: should be 0.,May represent total NAND writes (info) or failure count (bad)—vendor dependent.,"smart_248_raw,smart_171_raw",model_specific
+smart_240_raw,Head Flying Hours / Transfer Error,context-dependent,Both,If hours: increases; if errors: should be 0.,On HDDs: flying time. On some SSDs: transfer errors—interpret accordingly.,"smart_9_raw,smart_188_raw",model_specific
+smart_241_raw,Total LBAs Written,informational,Both,Steadily increases with write activity.,Useful for calculating drive wear (especially SSDs).,"smart_246_raw,smart_248_raw",info
+smart_242_raw,Total LBAs Read,informational,Both,Steadily increases with read activity.,"No direct health impact, but useful for workload analysis.",smart_247_raw,info
+smart_243_raw,Total LBAs Written (Extended),informational,Both,Same as smart_241_raw.,Redundant or extended counter on some drives.,smart_241_raw,info
+smart_244_raw,Average Erase Count,context-dependent,SSD,Increases with P/E cycles; rate indicates write intensity.,Average number of erase cycles per block—key for wear estimation.,"smart_233_raw,smart_177_raw",upper_pct:95
+smart_245_raw,Max/Min Erase Count,context-dependent,SSD,Delta shows wear leveling effectiveness.,Large difference = uneven wear = shorter lifespan.,"smart_177_raw,smart_173_raw",upper_pct:95
+smart_246_raw,Total Host Writes,informational,SSD,Increases with host writes.,Same as 241 but in GB or sectors—varies by vendor.,"smart_241_raw,smart_248_raw",info
+smart_247_raw,Total Host Reads,informational,SSD,Increases with host reads.,—,smart_242_raw,info
+smart_248_raw,NAND Writes,informational,SSD,Higher than host writes due to write amplification.,Internal writes = host writes × (1 + WA). High WA = inefficient controller.,"smart_246_raw,smart_241_raw",info
+smart_249_raw,Lifetime Writes (Intel SSD),informational,SSD,Cumulative writes; used for endurance estimation.,Intel-specific—helps estimate remaining life based on TBW rating.,"smart_241_raw,smart_233_raw",info
+smart_250_raw,Read/Write Error Retry Rate,lower,Both,Should be low; increasing trend = media degradation.,Retries before giving up—rising count = failing media.,"smart_187_raw,smart_197_raw",upper_pct:95
+smart_251_raw,Total LBAs Written (Alt),informational,Both,Same as smart_241_raw.,Alternate counter.,smart_241_raw,info
+smart_252_raw,Unrecoverable Read Error Count,lower,Both,Should be 0; indicates permanent data loss.,Similar to 187—critical error.,"smart_187_raw,smart_198_raw",hard_zero
+smart_254_raw,Free Fall Sensor,lower,HDD,Increases with drop events; should be 0 in desktops.,Found in laptop/mobile drives—counts free-fall protection triggers.,"smart_191_raw,smart_212_raw",hard_zero

@@ -2,6 +2,7 @@ import json
 import joblib
 import pandas as pd
 from pathlib import Path
+import time
 
 from config import (
     WINDOW_SIZE,
@@ -99,6 +100,8 @@ def get_selected_features_for_model(df: pd.DataFrame, disk_model: str, json_path
 def inference_local_csv():
     ensure_output_dirs()
 
+    ml_inference_start_time = time.perf_counter()
+
     payload = joblib.load(MODEL_PATH)
     model = payload["model"]
 
@@ -185,6 +188,8 @@ def inference_local_csv():
 
     df[output_cols].to_csv(OUTPUT_PATH, index=False)
 
+    ml_inference_end_time = time.perf_counter()
+    print(f"[exp#5] ml inference elpased time: {ml_inference_end_time}, data size: {after_inference}")
     print(f"Rows before inference filtering/filling: {before_inference}")
     print(f"Rows after inference preparation:      {after_inference}")
     print(f"Rows originally missing feature history: {int(raw_feature_na_mask.sum())}")
